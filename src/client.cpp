@@ -1,7 +1,10 @@
-
+// LinkFlow Phase 1.2: UDP Client Implementation
+// File: src/client.cpp
+// Purpose: Send packets to server and receive ACKs
 
 #include <iostream>
 #include <cstring>
+#include <iomanip>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -46,17 +49,62 @@ int main(int argc, char *argv[])
     struct Packet pkt;
     memset(&pkt, 0, sizeof(pkt));
 
-    // Fill packet fields (matching your packet.h structure)
-    pkt.seq_num = 1;                      // First packet
-    pkt.type = 0;                         // Data packet (0=data, 1=ACK)
-    strcpy(pkt.data, "Phase 1.2 Hello!"); // Test message
-    strcpy(pkt.filename, "test.txt");     // Dummy filename
+    // CORE FIELDS (Phase 1-2)
+    pkt.seq_num = 1; // First packet
+    pkt.ack_num = 0; // No ACK expected yet
+    pkt.type = 0;    // Data packet (0=data, 1=ACK, 2=start, 3=end, 4=NAK)
+
+    // ERROR DETECTION (Phase 2) - Dummy values for now
+    pkt.crc32 = 0x12345678; // Placeholder CRC32
+    pkt.parity = 1;         // Simple parity bit
+    pkt.checksum = 0xABCD;  // Internet checksum placeholder
+
+    // FILE TRANSFER (Phase 2)
+    strcpy(pkt.filename, "test.txt"); // Test filename
+    pkt.file_size = 1024;             // 1KB dummy file size
+    pkt.chunk_offset = 0;             // First chunk at offset 0
+
+    // PERFORMANCE (Phase 2.5-5)
+    pkt.stream_id = 0;   // Primary stream
+    pkt.window_size = 4; // Go-Back-N window size
+    pkt.rtt_sample = 50; // 50ms RTT sample
+
+    // SECURITY (Phase 7) - Zero initialized (not used in Phase 1.2)
+    memset(pkt.hmac, 0, sizeof(pkt.hmac));
+    memset(pkt.iv, 0, sizeof(pkt.iv));
+
+    // ADVANCED (Phase 5+)
+    pkt.fec_parity = 0; // No FEC yet
+    pkt.bitmap = 0;     // No selective repeat yet
+
+    // METADATA
+    strcpy(pkt.username, "test_user"); // Test username
+
+    // PAYLOAD
+    strcpy(pkt.data, "Phase 1.2 Hello! This is the test payload data."); // Test message
 
     cout << "📦 Packet prepared:" << endl;
+    cout << "   CORE FIELDS:" << endl;
     cout << "   - Sequence: " << pkt.seq_num << endl;
-    cout << "   - Type: " << pkt.type << " (DATA)" << endl;
-    cout << "   - Data: " << pkt.data << endl;
+    cout << "   - ACK Number: " << pkt.ack_num << endl;
+    cout << "   - Type: " << (int)pkt.type << " (DATA)" << endl;
+    cout << "\n   ERROR DETECTION:" << endl;
+    cout << "   - CRC32: 0x" << hex << pkt.crc32 << dec << endl;
+    cout << "   - Parity: " << (int)pkt.parity << endl;
+    cout << "   - Checksum: 0x" << hex << pkt.checksum << dec << endl;
+    cout << "\n   FILE TRANSFER:" << endl;
     cout << "   - Filename: " << pkt.filename << endl;
+    cout << "   - File Size: " << pkt.file_size << " bytes" << endl;
+    cout << "   - Chunk Offset: " << pkt.chunk_offset << endl;
+    cout << "\n   PERFORMANCE:" << endl;
+    cout << "   - Stream ID: " << (int)pkt.stream_id << endl;
+    cout << "   - Window Size: " << (int)pkt.window_size << endl;
+    cout << "   - RTT Sample: " << pkt.rtt_sample << "ms" << endl;
+    cout << "\n   METADATA:" << endl;
+    cout << "   - Username: " << pkt.username << endl;
+    cout << "\n   PAYLOAD:" << endl;
+    cout << "   - Data: " << pkt.data << endl;
+    cout << "\n   📏 Total Packet Size: " << sizeof(pkt) << " bytes" << endl;
 
     // STEP 5: Send Packet
     cout << "\n📤 Sending packet to server..." << endl;
