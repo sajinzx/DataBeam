@@ -1,2 +1,4 @@
-.exe
+#all exe files
+*.exe
 
+.vscode/
