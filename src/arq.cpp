@@ -12,7 +12,7 @@ using namespace std;
 
 // Constructor: Initialize ARQ state
 GoBackNARQ::GoBackNARQ()
-    : send_base(1), next_seq_num(1), 
+    : send_base(1), next_seq_num(1),
       srtt_us(INITIAL_RTO * 1000), rttvar_us(INITIAL_RTO * 500),
       rto_ms(INITIAL_RTO), congestion_window(1.0), threshold(32.0),
       in_slow_start(true)
@@ -56,7 +56,7 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
             auto duration = chrono::duration_cast<chrono::microseconds>(
                 now - it->send_time);
             uint32_t rtt_sample = duration.count();
-            
+
             // Update SRTT and RTTVAR using RFC 6298
             if (srtt_us == 0)
             {
@@ -65,19 +65,21 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
             }
             else
             {
-                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us + 
-                           BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
+                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us +
+                            BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
                 srtt_us = (1 - ALPHA_RTT) * srtt_us + ALPHA_RTT * rtt_sample;
             }
-            
+
             // Update RTO: SRTT + 4 * RTTVAR, with bounds [1ms, 60s]
             rto_ms = (srtt_us + 4 * rttvar_us) / 1000;
-            if (rto_ms < 1) rto_ms = 1;
-            if (rto_ms > 60000) rto_ms = 60000;
+            if (rto_ms < 1)
+                rto_ms = 1;
+            if (rto_ms > 60000)
+                rto_ms = 60000;
         }
         sent_buffer.pop_front();
     }
-    
+
     // Congestion control: AIMD Additive Increase
     if (in_slow_start && congestion_window < threshold)
     {
@@ -90,7 +92,7 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
         in_slow_start = false;
         congestion_window += AIMD_INCREASE / congestion_window;
     }
-    
+
     if (congestion_window > WINDOW_SIZE)
         congestion_window = WINDOW_SIZE;
 }
@@ -100,20 +102,20 @@ bool GoBackNARQ::check_for_timeout(Packet &pkt_to_retransmit)
 {
     if (sent_buffer.empty())
         return false;
-    
+
     auto now = chrono::high_resolution_clock::now();
     auto &oldest = sent_buffer.front();
     auto duration = chrono::duration_cast<chrono::milliseconds>(
         now - oldest.send_time);
-    
+
     if (duration.count() >= (long)rto_ms)
     {
         pkt_to_retransmit = oldest.pkt;
         oldest.retransmit_count++;
-        oldest.send_time = now;  // Reset timer for retransmit
+        oldest.send_time = now; // Reset timer for retransmit
         return true;
     }
-    
+
     return false;
 }
 
@@ -124,11 +126,11 @@ void GoBackNARQ::mark_loss()
     threshold = congestion_window / 2;
     congestion_window = threshold;
     in_slow_start = false;
-    
+
     if (congestion_window < 1.0)
         congestion_window = 1.0;
-    
-    cout << "⚠️  Packet loss detected! cwnd=" << congestion_window 
+
+    cout << "⚠️  Packet loss detected! cwnd=" << congestion_window
          << " ssthresh=" << threshold << endl;
 }
 
@@ -143,7 +145,7 @@ void GoBackNARQ::update_rtt(uint16_t seq_num)
             auto duration = chrono::duration_cast<chrono::microseconds>(
                 now - sp.send_time);
             uint32_t rtt_sample = duration.count();
-            
+
             // RFC 6298 RTT calculation
             if (srtt_us == 0)
             {
@@ -152,15 +154,17 @@ void GoBackNARQ::update_rtt(uint16_t seq_num)
             }
             else
             {
-                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us + 
-                           BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
+                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us +
+                            BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
                 srtt_us = (1 - ALPHA_RTT) * srtt_us + ALPHA_RTT * rtt_sample;
             }
-            
+
             rto_ms = (srtt_us + 4 * rttvar_us) / 1000;
-            if (rto_ms < 1) rto_ms = 1;
-            if (rto_ms > 60000) rto_ms = 60000;
-            
+            if (rto_ms < 1)
+                rto_ms = 1;
+            if (rto_ms > 60000)
+                rto_ms = 60000;
+
             return;
         }
     }
@@ -170,15 +174,15 @@ void GoBackNARQ::update_rtt(uint16_t seq_num)
 int compress_data(const char *input, size_t input_len, char *output, size_t &output_len)
 {
     uLongf compressed_size = output_len;
-    int ret = compress2((Bytef *)output, &compressed_size, 
-                       (const Bytef *)input, input_len, 6);
-    
+    int ret = compress2((Bytef *)output, &compressed_size,
+                        (const Bytef *)input, input_len, 6);
+
     if (ret == Z_OK)
     {
         output_len = compressed_size;
         return 0;
     }
-    
+
     return ret;
 }
 
@@ -187,13 +191,13 @@ int decompress_data(const char *input, size_t input_len, char *output, size_t &o
 {
     uLongf decompressed_size = output_len;
     int ret = uncompress((Bytef *)output, &decompressed_size,
-                        (const Bytef *)input, input_len);
-    
+                         (const Bytef *)input, input_len);
+
     if (ret == Z_OK)
     {
         output_len = decompressed_size;
         return 0;
     }
-    
+
     return ret;
 }
