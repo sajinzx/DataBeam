@@ -16,7 +16,7 @@
 
 using namespace std;
 
-const int RCVTIMEO_MS = 50;  // Non-blocking receive timeout (50ms)
+const int RCVTIMEO_MS = 50; // Non-blocking receive timeout (50ms)
 
 // Function to read a file and return its size
 long get_file_size(const char *filename)
@@ -104,7 +104,8 @@ int main(int argc, char *argv[])
     int acks_received = 0;
     uint64_t total_bytes_sent = 0;
 
-    cout << "\n📤 Starting Go-Back-N transmission (" << total_chunks << " chunks)...\n" << endl;
+    cout << "\n📤 Starting Go-Back-N transmission (" << total_chunks << " chunks)...\n"
+         << endl;
 
     while (chunk_offset < file_size || arq.get_in_flight_count() > 0)
     {
@@ -126,9 +127,9 @@ int main(int argc, char *argv[])
             // Compress data
             char compressed_data[DATA_SIZE];
             size_t compressed_len = DATA_SIZE;
-            int compress_ret = compress_data(chunk_data, bytes_read, 
+            int compress_ret = compress_data(chunk_data, bytes_read,
                                              compressed_data, compressed_len);
-            
+
             if (compress_ret != 0)
             {
                 cout << "⚠️  Compression failed, using uncompressed" << endl;
@@ -169,10 +170,10 @@ int main(int argc, char *argv[])
 
             if (bytes_sent > 0)
             {
-                cout << "📨 [" << arq.get_in_flight_count() + 1 << "/" << (int)arq.get_window_size() 
-                     << "] Seq=" << pkt.seq_num << " offset=" << chunk_offset 
+                cout << "📨 [" << arq.get_in_flight_count() + 1 << "/" << (int)arq.get_window_size()
+                     << "] Seq=" << pkt.seq_num << " offset=" << chunk_offset
                      << " bytes=" << bytes_read << " (compressed: " << compressed_len << ")" << endl;
-                
+
                 arq.record_sent_packet(pkt);
                 arq.increment_seq_num();
                 chunk_offset += bytes_read;
@@ -200,9 +201,9 @@ int main(int argc, char *argv[])
 
             if (ack_pkt.type == 1) // ACK
             {
-                cout << "✅ ACK for seq=" << ack_pkt.ack_num 
+                cout << "✅ ACK for seq=" << ack_pkt.ack_num
                      << " (RTT sample: " << (int)arq.get_ewma_rtt() << "ms)" << endl;
-                
+
                 arq.handle_ack(ack_pkt.ack_num);
                 acks_received++;
             }
@@ -220,10 +221,10 @@ int main(int argc, char *argv[])
             cout << "⏱️  Timeout! Retransmitting seq=" << retransmit_pkt.seq_num << endl;
             struct Packet pkt_send = retransmit_pkt;
             serialize_packet(&pkt_send);
-            
+
             sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                    (struct sockaddr *)&server_addr, addr_len);
-            
+
             arq.mark_loss();
         }
     }
@@ -232,8 +233,10 @@ int main(int argc, char *argv[])
 
     auto end_time = chrono::high_resolution_clock::now();
     double elapsed_sec = chrono::duration_cast<chrono::milliseconds>(
-        end_time - start_time).count() / 1000.0;
-    
+                             end_time - start_time)
+                             .count() /
+                         1000.0;
+
     double throughput_mbps = (total_bytes_sent * 8.0) / (elapsed_sec * 1e6);
 
     cout << "\n✅ File transfer COMPLETE!" << endl;
