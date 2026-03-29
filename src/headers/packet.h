@@ -2,6 +2,7 @@
 #define PACKET_H
 
 #include <stdint.h>
+#include <cstring>
 
 #define PORT 12345
 #define DATA_SIZE 1000
@@ -44,5 +45,50 @@ struct Packet
     // PAYLOAD (compressed/encrypted data)
     char data[DATA_SIZE];  // File chunk/message
 } __attribute__((packed)); // Zero padding!
+
+// CRC32 calculation using IEEE 802.3 standard polynomial
+inline uint32_t calculate_crc32(const unsigned char *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    const uint32_t POLYNOMIAL = 0xEDB88320; // IEEE 802.3 reversed
+
+    for (size_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 1)
+                crc = (crc >> 1) ^ POLYNOMIAL;
+            else
+                crc >>= 1;
+        }
+    }
+
+    return crc ^ 0xFFFFFFFF;
+}
+
+// Serialize packet: convert host byte order to network byte order
+inline void serialize_packet(struct Packet *pkt)
+{
+    pkt->seq_num = htons(pkt->seq_num);
+    pkt->ack_num = htons(pkt->ack_num);
+    pkt->crc32 = htonl(pkt->crc32);
+    pkt->file_size = htonl(pkt->file_size);
+    pkt->chunk_offset = htonl(pkt->chunk_offset);
+    pkt->checksum = htons(pkt->checksum);
+    pkt->rtt_sample = htons(pkt->rtt_sample);
+}
+
+// Deserialize packet: convert network byte order to host byte order
+inline void deserialize_packet(struct Packet *pkt)
+{
+    pkt->seq_num = ntohs(pkt->seq_num);
+    pkt->ack_num = ntohs(pkt->ack_num);
+    pkt->crc32 = ntohl(pkt->crc32);
+    pkt->file_size = ntohl(pkt->file_size);
+    pkt->chunk_offset = ntohl(pkt->chunk_offset);
+    pkt->checksum = ntohs(pkt->checksum);
+    pkt->rtt_sample = ntohs(pkt->rtt_sample);
+}
 
 #endif
