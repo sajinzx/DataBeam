@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <cstring>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #define PORT 12345
 #define DATA_SIZE 1000
