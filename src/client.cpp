@@ -130,11 +130,25 @@ int main(int argc, char *argv[])
             int compress_ret = compress_data(chunk_data, bytes_read,
                                              compressed_data, compressed_len);
 
+            bool is_compressed = false;
             if (compress_ret != 0)
             {
                 cout << "⚠️  Compression failed, using uncompressed" << endl;
                 memcpy(compressed_data, chunk_data, bytes_read);
                 compressed_len = bytes_read;
+                is_compressed = false;
+            }
+            else if (compressed_len < bytes_read)
+            {
+                // Only mark as compressed if it actually reduced size
+                is_compressed = true;
+            }
+            else
+            {
+                // Compression made it larger, send uncompressed
+                memcpy(compressed_data, chunk_data, bytes_read);
+                compressed_len = bytes_read;
+                is_compressed = false;
             }
 
             // Create packet
@@ -143,7 +157,11 @@ int main(int argc, char *argv[])
 
             pkt.seq_num = arq.get_next_seq_num();
             pkt.ack_num = 0;
-            pkt.type = (chunk_offset + bytes_read >= file_size) ? 3 : 0; // 3=END
+            // Set type: 5=COMPRESSED, 0=DATA, 3=END
+            if (chunk_offset + bytes_read >= file_size)
+                pkt.type = 3; // END packet
+            else
+                pkt.type = is_compressed ? 5 : 0; // COMPRESSED or DATA
 
             strcpy(pkt.filename, filename);
             pkt.file_size = file_size;
@@ -170,9 +188,12 @@ int main(int argc, char *argv[])
 
             if (bytes_sent > 0)
             {
+                std::string compression_status = is_compressed ? 
+                    " [COMPRESSED]" : " [UNCOMPRESSED]";
                 cout << "📨 [" << arq.get_in_flight_count() + 1 << "/" << (int)arq.get_window_size()
                      << "] Seq=" << pkt.seq_num << " offset=" << chunk_offset
-                     << " bytes=" << bytes_read << " (compressed: " << compressed_len << ")" << endl;
+                     << " bytes=" << bytes_read << " (sent: " << compressed_len << ")"
+                     << compression_status << endl;
 
                 arq.record_sent_packet(pkt);
                 arq.increment_seq_num();
