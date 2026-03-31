@@ -124,28 +124,31 @@ void *sender_thread(void *arg)
             is_compressed = false;
         }
 
-        // Build packet
-        struct Packet pkt;
-        memset(&pkt, 0, sizeof(pkt));
-        pkt.seq_num = seq;
-        pkt.ack_num = 0;
-        pkt.type = (current_offset + bytes_read >= (uint32_t)file_size)
-                       ? 3                        // END
-                       : (is_compressed ? 5 : 0); // DATA
-        strcpy(pkt.filename, filename.c_str());
-        pkt.file_size = file_size;
-        pkt.chunk_offset = current_offset;
-        pkt.crc32 = calculate_crc32((unsigned char *)compressed_data, compressed_len);
-        pkt.data_len = (uint16_t)compressed_len; // [CHANGED] Add data_len field for variable payload size
-        memcpy(pkt.data, compressed_data, compressed_len);
-        strcpy(pkt.username, "client_user");
-        // [CHANGED] SR has no congestion window / EWMA RTT; omit those fields
-        pkt.window_size = SR_WINDOW_SIZE;
-        pkt.rtt_sample = 0;
+        // --- 2. BUILD THE SLIM DATA PACKET ---
+        struct SlimDataPacket slim_pkt;
+        memset(&slim_pkt, 0, sizeof(slim_pkt));
 
-        // Serialize a copy for sending
-        struct Packet pkt_send = pkt;
-        serialize_packet(&pkt_send);
+        slim_pkt.type = (current_offset + bytes_read >= (uint32_t)file_size) ? 3 : 0;
+        slim_pkt.seq_num = seq; // Now 32-bit
+                                // slim_pkt.chunk_offset = current_offset;
+        slim_pkt.data_len = (uint16_t)compressed_len;
+
+        // Use the flags byte to signal compression (Bit 0)
+        slim_pkt.flags = is_compressed ? 0x01 : 0x00;
+
+        // Zero out the Security Fields for now
+        slim_pkt.packet_iv = 0;
+        memset(slim_pkt.hmac, 0, 16);
+
+        // Copy the actual data
+        memcpy(slim_pkt.data, compressed_data, compressed_len);
+
+        // Calculate CRC only on the payload data
+        slim_pkt.crc32 = calculate_crc32((unsigned char *)slim_pkt.data, slim_pkt.data_len);
+
+        // --- 3. SERIALIZE AND SEND ---
+        struct SlimDataPacket pkt_send = slim_pkt;
+        serialize_slim_packet(&pkt_send);
 
         int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                                 (struct sockaddr *)&server_addr, addr_len);
@@ -153,11 +156,13 @@ void *sender_thread(void *arg)
         if (bytes_sent > 0)
         {
             pthread_mutex_lock(&arq_mutex);
-            arq.record_sent_packet(pkt); // records pkt and sets send timestamp
-            arq.increment_seq_num();     // [CHANGED] advance manually (no increment_seq_num in SR)
+            // [IMPORTANT] arq.record_sent_packet must now accept SlimDataPacket
+            arq.record_sent_packet(slim_pkt);
+
             chunk_offset += bytes_read;
             chunks_sent++;
             total_bytes_sent += bytes_read;
+            pthread_mutex_unlock(&arq_mutex);
             // if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
             // {
 
@@ -238,45 +243,47 @@ void *timeout_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        uint16_t timed_out_seq = 0;
+        // [CHANGED] Must be uint32_t to handle 1GB files (947,000+ packets)
+        uint32_t timed_out_seq = 0;
 
         pthread_mutex_lock(&arq_mutex);
-        // [CHANGED] SR returns the seq_num of the first timed-out packet (0 = none)
+        // SR returns the 32-bit seq_num of the first timed-out packet (0 = none)
         timed_out_seq = arq.check_for_timeout();
         pthread_mutex_unlock(&arq_mutex);
 
         if (timed_out_seq != 0)
         {
-            Packet retransmit_pkt;
+            // [CHANGED] Use SlimDataPacket to match the new network protocol
+            SlimDataPacket retransmit_pkt;
             bool ready = false;
 
             pthread_mutex_lock(&arq_mutex);
-            // [CHANGED] prepare_retransmit resets the timer, increments retry count,
-            //           and returns false if max retransmits exceeded
-            retransmissions++;
+            // prepare_retransmit fills our 'retransmit_pkt' from its internal buffer
             ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
+            if (ready)
+                retransmissions++;
             pthread_mutex_unlock(&arq_mutex);
 
             if (ready)
             {
-                // cout << "  Timeout! SR retransmitting only seq=" << timed_out_seq
-                //      << " (not full window)" << endl;
+                // Serialize specifically for the Slim structure
+                SlimDataPacket pkt_send = retransmit_pkt;
+                serialize_slim_packet(&pkt_send);
 
-                struct Packet pkt_send = retransmit_pkt;
-                serialize_packet(&pkt_send);
+                // bytes_sent will now be ~1.4KB instead of the old ~1.8KB
                 sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                        (struct sockaddr *)&server_addr, addr_len);
             }
             else
             {
-                // Max retransmits exceeded — abort transfer
-                cerr << " Max retransmits exceeded for seq=" << timed_out_seq
-                     << ". Aborting." << endl;
+                cerr << " [TIMEOUT] Max retries exceeded for seq=" << timed_out_seq << ". Aborting." << endl;
                 transfer_complete = true;
             }
         }
 
-        Sleep(10); // Poll every 5ms
+        // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
+        // a 1ms sleep makes the client respond to loss much faster.
+        Sleep(1);
     }
     return nullptr;
 }
@@ -358,8 +365,8 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 300 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
-    int buffer_size = 32 * 1024 * 1024; // 16 MB
+    tv.tv_usec = 200 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    int buffer_size = 64 * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -382,6 +389,14 @@ int main(int argc, char *argv[])
 
     auto start_time = chrono::high_resolution_clock::now();
 
+    StartPacket start_pkt;
+    start_pkt.type = 2;
+    start_pkt.file_size = file_size;
+    start_pkt.total_chunks = total_chunks;
+    strncpy(start_pkt.filename, filename.c_str(), 256);
+    serialize_start_packet(&start_pkt);
+    sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0, (struct sockaddr *)&server_addr, addr_len);
+    
     pthread_t t_sender, t_receiver, t_timeout, t_logger;
     pthread_create(&t_sender, nullptr, sender_thread, nullptr);
     pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);

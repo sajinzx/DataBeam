@@ -14,14 +14,14 @@
 #include <cstring>
 
 // Constants for Selective Repeat ARQ
-#define SR_WINDOW_SIZE 1024      // Sliding window size (N=8)
-#define SR_PACKET_TIMEOUT_MS 300 // Individual packet timeout: 500ms
-#define SR_MAX_RETRANSMITS 200   // Max retransmit attempts per packet
+#define SR_WINDOW_SIZE 1024     // Sliding window size (N=8)
+#define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout: 500ms
+#define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
 {
-    Packet pkt;           // The actual packet data
+    SlimDataPacket pkt;           // The actual packet data
     timespec send_time;   // Send timestamp (CLOCK_MONOTONIC)
     bool is_acked;        // Has this packet been acknowledged?
     int retransmit_count; // Number of retransmission attempts
@@ -29,7 +29,7 @@ struct WindowPacket
     // Constructor
     WindowPacket() : is_acked(false), retransmit_count(0)
     {
-        memset(&pkt, 0, sizeof(Packet));
+        memset(&pkt, 0, sizeof(SlimDataPacket));
         memset(&send_time, 0, sizeof(timespec));
     }
 };
@@ -66,11 +66,11 @@ public:
 
     // === Packet Buffer Management ===
     // Record a packet as sent (store in window_buffer with current timestamp)
-    void record_sent_packet(const Packet &pkt);
-
+    void record_sent_packet(const SlimDataPacket &pkt);
+    void record_sent_packet(const StartPacket &pkt);
     // Retrieve a packet by sequence number (for retransmission)
-    bool get_packet_for_retransmit(uint16_t seq_num, Packet &pkt_out);
-
+    bool get_packet_for_retransmit(uint16_t seq_num, SlimDataPacket &pkt_out);
+    bool get_packet_for_retransmit(uint16_t seq_num, StartPacket &pkt_out);
     // === ACK Processing ===
     // Handle individual ACK for a specific packet (not cumulative)
     void handle_ack(uint16_t ack_num);
@@ -87,8 +87,8 @@ public:
     uint16_t check_for_timeout();
 
     // Prepare packet for retransmission (updates send_time and retransmit_count)
-    bool prepare_retransmit(uint16_t seq_num, Packet &pkt_out);
-
+    bool prepare_retransmit(uint16_t seq_num, SlimDataPacket &pkt_out);
+    bool prepare_retransmit(uint16_t seq_num, StartPacket &pkt_out);
     // === Statistics & Debugging ===
     uint16_t get_window_size() const { return SR_WINDOW_SIZE; }
     uint8_t get_acked_count() const { return ack_bitmap.count(); }

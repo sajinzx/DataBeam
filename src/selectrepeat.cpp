@@ -39,7 +39,7 @@ int SelectiveRepeatARQ::get_in_flight_count() const
 }
 
 // Record a packet as sent with timestamp
-void SelectiveRepeatARQ::record_sent_packet(const Packet &pkt)
+void SelectiveRepeatARQ::record_sent_packet(const SlimDataPacket &pkt)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -160,7 +160,7 @@ uint16_t SelectiveRepeatARQ::check_for_timeout()
 }
 
 // Prepare packet for retransmission (reset timer, increment counter)
-bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
+bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, SlimDataPacket &pkt_out)
 {
     pthread_mutex_lock(&window_mutex);
 
@@ -192,7 +192,7 @@ bool SelectiveRepeatARQ::prepare_retransmit(uint16_t seq_num, Packet &pkt_out)
 }
 
 // Retrieve packet data for retransmission
-bool SelectiveRepeatARQ::get_packet_for_retransmit(uint16_t seq_num, Packet &pkt_out)
+bool SelectiveRepeatARQ::get_packet_for_retransmit(uint16_t seq_num, SlimDataPacket &pkt_out)
 {
     pthread_mutex_lock(&window_mutex);
 

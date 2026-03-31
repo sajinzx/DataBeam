@@ -33,7 +33,7 @@ uint8_t GoBackNARQ::get_window_size() const
 }
 
 // Record a packet as sent
-void GoBackNARQ::record_sent_packet(const Packet &pkt)
+void GoBackNARQ::record_sent_packet(const SlimDataPacket &pkt)
 {
     SentPacket sp;
     sp.pkt = pkt;
@@ -98,7 +98,7 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
 }
 
 // Check for timeout and prepare packet for retransmission
-bool GoBackNARQ::check_for_timeout(Packet &pkt_to_retransmit)
+bool GoBackNARQ::check_for_timeout(const SlimDataPacket &pkt_to_retransmit)
 {
     if (sent_buffer.empty())
         return false;

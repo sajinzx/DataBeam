@@ -11,15 +11,15 @@
 #include <queue>
 #include <pthread.h>
 #include "./headers/packet.h"
-#include "./headers/arq.h"
+// #include "./headers/arq.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 using namespace std;
-
+#define BUFFER_SIZE 1024
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
 struct WorkItem
 {
-    Packet pkt;
+    SlimDataPacket pkt;
     size_t compressed_len;
 };
 
@@ -99,29 +99,27 @@ struct DecodedPacket
     uint32_t file_size;
     uint32_t chunk_offset;
 };
-
 void *worker_thread(void *arg)
 {
-    // All file state lives here — only this thread touches the file
-    DecodedPacket *memory_pool = new DecodedPacket[1024];
-
-    // Track which slots are currently "occupied" with data
+    // 1. PRE-ALLOCATED POOL: 1024 slots is enough for a 256-512 window.
+    // Use SlimDataPacket as the base for the pool.
+    SlimDataPacket *memory_pool = new SlimDataPacket[1024];
     bool slot_occupied[1024];
     memset(slot_occupied, false, sizeof(slot_occupied));
+
     ofstream outfile;
-    string out_filepath = "";
     string current_filename = "";
-    uint16_t expected_seq_num = 1;
+    uint32_t expected_seq_num = 1; // [CRITICAL] Must be 32-bit for 1GB files
     bool connection_init = false;
 
     while (!server_done)
     {
-        // ---- Pop from queue ------------------------------------------------
         WorkItem item;
         {
             pthread_mutex_lock(&queue_mutex);
             while (work_queue.empty() && !server_done)
                 pthread_cond_wait(&queue_cond, &queue_mutex);
+
             if (server_done && work_queue.empty())
             {
                 pthread_mutex_unlock(&queue_mutex);
@@ -132,145 +130,94 @@ void *worker_thread(void *arg)
             pthread_mutex_unlock(&queue_mutex);
         }
 
-        Packet &pkt = item.pkt;
+        // Use the SlimDataPacket structure
+        SlimDataPacket &pkt = item.pkt;
 
-        // ---- File init (mirrors network thread logic) ----------------------
-        if (!connection_init || string(pkt.filename) != current_filename)
+        // ---- 2. DECOMPRESS INTO TEMPORARY BUFFER ---------------------------
+        char decompressed_buffer[DATA_SIZE + 1];
+        size_t decomp_len = DATA_SIZE;
+
+        // Only decompress if the compression flag is set in the header
+        if (pkt.flags & 0x01)
         {
-            if (outfile.is_open())
-            {
-                outfile.flush();
-                outfile.close();
-            }
-            current_filename = pkt.filename;
-            out_filepath = "received/recv_" + current_filename;
-            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
-            if (!outfile.is_open())
-            {
-                cerr << "[WORKER] Cannot create: " << out_filepath << endl;
+            int ret = decompress_data(pkt.data, item.compressed_len,
+                                      decompressed_buffer, decomp_len);
+            if (ret != 0)
                 continue;
-            }
-            expected_seq_num = 1;
-            // Instead of receive_buffer.clear();
-            memset(slot_occupied, false, sizeof(slot_occupied));
-            connection_init = true;
         }
-
-        // ---- Decompress ----------------------------------------------------
-        DecodedPacket decoded;
-        decoded.data_len = sizeof(decoded.data);
-        int ret = decompress_data(pkt.data, item.compressed_len,
-                                  decoded.data, decoded.data_len);
-        if (ret != 0)
+        else
         {
-            // This should never happen — CRC passed in network thread
-            // meaning data arrived intact. If decompress fails here
-            // it means compress_data produced data that decompress_data
-            // can't handle — that's a compress.h bug, not a network bug.
-            cerr << "[WORKER] Decomp failed seq=" << pkt.seq_num
-                 << " err=" << ret << endl;
-            continue;
+            // Raw copy if not compressed
+            memcpy(decompressed_buffer, pkt.data, item.compressed_len);
+            decomp_len = item.compressed_len;
         }
 
-        decoded.type = pkt.type;
-        decoded.file_size = pkt.file_size;
-        decoded.chunk_offset = pkt.chunk_offset;
-
-        // ---- Buffer or write (same logic as before) ------------------------
+        // ---- 3. IN-ORDER OR OUT-OF-ORDER LOGIC -----------------------------
         if (pkt.seq_num == expected_seq_num)
         {
-            size_t remaining = (size_t)decoded.file_size - decoded.chunk_offset;
-            size_t write_len = min(decoded.data_len, remaining);
-
-            outfile.write(decoded.data, (streamsize)write_len);
-            if (outfile.fail())
-            {
-                cerr << "[WORKER] Write failed seq=" << pkt.seq_num << endl;
-                outfile.clear();
-            }
+            // Write directly to the correct offset
+            // uint32_t Offset = (pkt.seq_num - 1) * DATA_SIZE;
+            outfile.seekp(pkt.chunk_offset, ios::beg);
+            outfile.write(decompressed_buffer, (streamsize)decomp_len);
 
             expected_seq_num++;
-            if (expected_seq_num % 1000 == 0)
-            {
-                save_checkpoint(current_filename, expected_seq_num);
-            }
-            // save_checkpoint(current_filename, expected_seq_num);
 
-            // Drain buffer
+            // 4. DRAIN THE POOL (Selective Repeat)
             while (slot_occupied[expected_seq_num % 1024])
             {
                 int idx = expected_seq_num % 1024;
-                DecodedPacket &bp = memory_pool[idx];
+                SlimDataPacket &bp = memory_pool[idx];
+                // Offset = (pkt.seq_num - 1) * DATA_SIZE;
+                //  Note: In a fully professional version, you'd store
+                //  decompressed data in the pool. For simplicity here,
+                //  we assume data in pool is ready to write.
+                outfile.seekp(bp.chunk_offset, ios::beg);
+                outfile.write(bp.data, bp.data_len);
 
-                // 1. Calculate length and write
-                size_t bp_remaining = (size_t)bp.file_size - bp.chunk_offset;
-                size_t bp_write_len = min(bp.data_len, bp_remaining);
-
-                outfile.write(bp.data, (streamsize)bp_write_len);
-
-                if (outfile.fail())
-                {
-                    save_checkpoint(current_filename, expected_seq_num);
-                    cerr << "[WORKER] Write failed buffered seq=" << expected_seq_num << endl;
-                    outfile.clear();
-                    break;
-                }
-
-                // 2. Performance: Batch Checkpointing (Crucial for 1GB!)
-                // Only write to disk (resume.json) every 1000 chunks to save I/O time
                 if (expected_seq_num % 1000 == 0)
-                {
                     save_checkpoint(current_filename, expected_seq_num);
-                }
 
-                // 3. Mark the end condition
                 bool is_end = (bp.type == 3);
-
-                // 4. Free the slot for the next "lap" of the circular buffer
                 slot_occupied[idx] = false;
                 expected_seq_num++;
 
                 if (is_end)
                 {
-                    outfile.flush();
-                    outfile.close();
-                    connection_init = false;
-                    remove("resume.json");
-                    cout << "[WORKER] Transfer complete: " << out_filepath << endl;
                     server_done = true;
                     break;
                 }
             }
-
-            if (decoded.type == 3 && outfile.is_open())
-            {
-                outfile.flush();
-                outfile.close();
-                connection_init = false;
-                remove("resume.json");
-                cout << "[WORKER] Transfer complete: " << out_filepath << endl;
-                server_done = true;
-            }
         }
         else if (pkt.seq_num > expected_seq_num)
         {
+            // Store out-of-order packet in the pool
             int idx = pkt.seq_num % 1024;
-
-            // Safety: Only store if we aren't already holding this packet
             if (!slot_occupied[idx])
             {
-                // Direct copy into the pre-allocated slot
-                memory_pool[idx] = decoded;
+                // Copy the header and the decompressed data into the pool
+                memory_pool[idx] = pkt;
+                memcpy(memory_pool[idx].data, decompressed_buffer, decomp_len);
+                memory_pool[idx].data_len = (uint16_t)decomp_len;
                 slot_occupied[idx] = true;
             }
         }
+
+        if (pkt.type == 3)
+        {
+            // End of file cleanup
+            outfile.flush();
+            outfile.close();
+            remove("resume.json");
+            server_done = true;
+        }
     }
 
+    delete[] memory_pool;
     return nullptr;
 }
 int main()
 {
-    cout << " LinkFlow Phase 4 Server Starting..." << endl;
+    cout << " DataBeam Phase 4 Server Starting..." << endl;
     SetConsoleOutputCP(CP_UTF8);
 
     WSADATA wsaData;
@@ -290,7 +237,7 @@ int main()
     }
 
     // Large socket buffers — absorb bursts without dropping
-    int buf_size = 32 * 1024 * 1024;
+    int buf_size = 64 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size, sizeof(buf_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size, sizeof(buf_size));
 
@@ -321,71 +268,90 @@ int main()
 
     // FIX: buffer stores DecodedPacket — already CRC-checked and decompressed
     // No duplicate work when draining
-    DecodedPacket *fast_buffer[512] = {nullptr};
+    DecodedPacket *fast_buffer[BUFFER_SIZE] = {nullptr};
 
     ofstream outfile;
     pthread_t t_worker;
     pthread_create(&t_worker, nullptr, worker_thread, nullptr);
     while (is_receiving)
     {
-        Packet pkt;
-        memset(&pkt, 0, sizeof(pkt));
-
-        int bytes_recv = recvfrom(sockfd, (char *)&pkt, sizeof(pkt), 0,
-                                  (struct sockaddr *)&client_addr, &addr_len);
-
+        char raw_buffer[2048];
+        int bytes_recv = recvfrom(sockfd, raw_buffer, sizeof(raw_buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
         if (bytes_recv <= 0)
-            continue; // timeout or error — loop again
-
-        deserialize_packet(&pkt);
-
-        // ---- Validate data_len --------------------------------------------
-        size_t compressed_len = pkt.data_len;
-        if (compressed_len == 0 || compressed_len > (size_t)(DATA_SIZE + 1))
-        {
-            cerr << "[SERVER] Bad data_len=" << compressed_len
-                 << " seq=" << pkt.seq_num << endl;
             continue;
-        }
 
-        // ---- Send ACK immediately after length check (before heavy work) --
-        // FIX: ACK sent as small struct, not full Packet — reduces ACK latency
-        // FIX: ACK sent BEFORE decode so the client's RTO doesn't expire
-        //      while we decompress
-        // ---- CRC check — must pass before ACK ------------------------------------
-        uint32_t computed = calculate_crc32(
-            reinterpret_cast<const unsigned char *>(pkt.data),
-            compressed_len);
-
-        if (computed != pkt.crc32)
+        uint8_t p_type = (uint8_t)raw_buffer[0]; // Peek at type without deserializing full packet (type is at fixed offset)
+        if (p_type == 2)
         {
-            cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
-                 << " expected=0x" << hex << pkt.crc32
-                 << " got=0x" << computed << dec << endl;
-            continue; // don't ACK — client will retransmit
+            if (!connection_initialized)
+            {
+                StartPacket *sp = (StartPacket *)raw_buffer;
+                deserialize_start_packet(sp);
+                current_filename = sp->filename;
+                out_filepath = "received/recv_" + current_filename;
+                outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+                if (!outfile.is_open())
+                {
+                    cerr << "[SERVER] Cannot create: " << out_filepath << endl;
+                    continue;
+                }
+                connection_initialized = true;
+            }
         }
+        if (p_type == 0)
         {
-            ACKPacket small_ack;
-            small_ack.type = 1;
-            small_ack.ack_num = htons(pkt.seq_num);
-            small_ack.bitmap = htons((uint16_t)(1u << (pkt.seq_num % 16)));
-            small_ack.crc32 = htonl(calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4));
+            SlimDataPacket pkt;
+            memcpy(&pkt, raw_buffer, bytes_recv);
+            deserialize_slim_packet(&pkt);
+            // 1. Get length safely
+            uint16_t actual_len = pkt.data_len;
+            // ---- Validate data_len --------------------------------------------
+            size_t compressed_len = pkt.data_len;
 
-            // serialize_packet(&small_ack);
-            sendto(sockfd, (const char *)&small_ack, sizeof(small_ack), 0,
-                   (struct sockaddr *)&client_addr, addr_len);
+            if (compressed_len == 0 || compressed_len > (size_t)(DATA_SIZE + 1))
+            {
+                cerr << "[SERVER] Bad data_len=" << compressed_len
+                     << " seq=" << pkt.seq_num << endl;
+                continue;
+            }
+
+            // ---- Send ACK immediately after length check (before heavy work) --
+            // FIX: ACK sent as small struct, not full Packet — reduces ACK latency
+            // FIX: ACK sent BEFORE decode so the client's RTO doesn't expire
+            //      while we decompress
+            // ---- CRC check — must pass before ACK ------------------------------------
+
+            uint32_t computed = calculate_crc32((unsigned char *)pkt.data, actual_len);
+
+            // 3. Compare against Big-Endian CRC from network
+            if (computed != pkt.crc32)
+            {
+                cerr << "[SERVER] CRC FAIL" << endl;
+                continue;
+            }
+            // Convert header fields to host byte order for easier processing
+            {
+                ACKPacket small_ack;
+                small_ack.type = 1;
+                small_ack.ack_num = pkt.seq_num;
+                small_ack.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
+                small_ack.crc32 = calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4);
+                serialize_ack_packet(&small_ack);
+                // serialize_packet(&small_ack);
+                sendto(sockfd, (const char *)&small_ack, sizeof(small_ack), 0,
+                       (struct sockaddr *)&client_addr, addr_len);
+            }
+            {
+                WorkItem item;
+                item.pkt = pkt;
+                item.compressed_len = compressed_len;
+
+                pthread_mutex_lock(&queue_mutex);
+                work_queue.push(item);
+                pthread_cond_signal(&queue_cond); // wake worker thread
+                pthread_mutex_unlock(&queue_mutex);
+            }
         }
-        {
-            WorkItem item;
-            item.pkt = pkt;
-            item.compressed_len = compressed_len;
-
-            pthread_mutex_lock(&queue_mutex);
-            work_queue.push(item);
-            pthread_cond_signal(&queue_cond); // wake worker thread
-            pthread_mutex_unlock(&queue_mutex);
-        }
-
         // pkt.seq_num < expected_seq_num → duplicate, already processed, ignore
     }
     server_done = true;
