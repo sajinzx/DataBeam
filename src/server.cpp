@@ -130,7 +130,9 @@ int main()
         return 1;
     }
     cout << " UDP socket created (fd=" << sockfd << ")" << endl;
-
+    int buffer_size = 16 * 1024 * 1024; // 16 MB
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -152,6 +154,15 @@ int main()
     bool is_receiving = true;
     string current_filename = "";
     bool connection_initialized = false;
+    ofstream outfile; // Declare outside the loop
+    string out_filepath = "received/recv_" + current_filename;
+    // Inside your metadata/initialization logic (when you get the filename)
+    outfile.open(out_filepath, ios::binary | ios::trunc);
+    if (!outfile.is_open())
+    {
+        cerr << "[SERVER] Fatal Error: Cannot create " << out_filepath << endl;
+        return 1;
+    }
 
     while (is_receiving)
     {
@@ -174,13 +185,13 @@ int main()
                 uint16_t resume_seq = load_checkpoint(current_filename);
                 if (resume_seq > 1)
                 {
-                    cout << "\n Checkpoint loaded! Resuming transfer of " << current_filename << " from seq=" << resume_seq << endl;
+                    // cout << "\n Checkpoint loaded! Resuming transfer of " << current_filename << " from seq=" << resume_seq << endl;
                     expected_seq_num = resume_seq;
 
                     // 2. Feature: Rolling Hash Comparison
-                    cout << " Computing rolling hashes for delta transfer comparison..." << endl;
+                    // cout << " Computing rolling hashes for delta transfer comparison..." << endl;
                     vector<uint32_t> hashes = compute_file_hashes(filepath);
-                    cout << "   -> Found " << hashes.size() << " existing chunk hashes in received/." << endl;
+                    // cout << "   -> Found " << hashes.size() << " existing chunk hashes in received/." << endl;
                 }
                 else
                 {
@@ -232,12 +243,11 @@ int main()
                 sendto(sockfd, (const char *)&ack_pkt, sizeof(ack_pkt), 0,
                        (struct sockaddr *)&client_addr, addr_len);
 
-                cout << " Received seq=" << pkt.seq_num << " (Individual SR ACK Sent, Bitmap=" << ack_pkt.bitmap << ")" << endl;
+                // cout << " Received seq=" << pkt.seq_num << " (Individual SR ACK Sent, Bitmap=" << ack_pkt.bitmap << ")" << endl;
 
                 // File Reassembly Logic
                 if (pkt.seq_num == expected_seq_num)
                 {
-                    string out_filepath = "received/recv_" + current_filename;
 
                     // ---- Decompress (handles both raw and deflated via marker byte) ------------
                     char decompressed[DATA_SIZE];
@@ -261,18 +271,6 @@ int main()
                     {
                         // First packet ever → truncate (create fresh file)
                         // All subsequent    → append
-                        ios::openmode mode = ios::binary |
-                                             (pkt.seq_num == 1 && expected_seq_num == 1
-                                                  ? ios::trunc
-                                                  : ios::app);
-
-                        ofstream outfile(out_filepath, mode);
-
-                        if (!outfile.is_open())
-                        {
-                            cerr << "[SERVER] Cannot open output file: " << out_filepath << endl;
-                            continue;
-                        }
 
                         // BUG FIX: write from decompressed buffer, not decomp_result (int)
                         // decompressed_len is set by decompress_data to the actual output size
@@ -365,14 +363,6 @@ int main()
                         // Write to file
                         // ----------------------------------------------------------------
                         {
-                            ofstream outfile(out_filepath, ios::binary | ios::app);
-
-                            if (!outfile.is_open())
-                            {
-                                cerr << "[SERVER] Cannot open file for buffered write: "
-                                     << out_filepath << endl;
-                                break;
-                            }
 
                             outfile.write(buf_decomp_data, (streamsize)write_len);
 

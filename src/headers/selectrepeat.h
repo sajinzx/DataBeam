@@ -15,8 +15,8 @@
 
 // Constants for Selective Repeat ARQ
 #define SR_WINDOW_SIZE 128       // Sliding window size (N=8)
-#define SR_PACKET_TIMEOUT_MS 500 // Individual packet timeout: 500ms
-#define SR_MAX_RETRANSMITS 5     // Max retransmit attempts per packet
+#define SR_PACKET_TIMEOUT_MS 700 // Individual packet timeout: 500ms
+#define SR_MAX_RETRANSMITS 8     // Max retransmit attempts per packet
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket

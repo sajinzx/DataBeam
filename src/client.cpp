@@ -16,6 +16,7 @@
 #include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
+#include <filesystem> // C++17
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -27,7 +28,7 @@ pthread_mutex_t arq_mutex = PTHREAD_MUTEX_INITIALIZER;
 int sockfd;
 struct sockaddr_in server_addr;
 socklen_t addr_len;
-
+string filename;
 const char *filename_str;
 long file_size;
 uint32_t chunk_offset = 0;
@@ -130,7 +131,7 @@ void *sender_thread(void *arg)
         pkt.type = (current_offset + bytes_read >= (uint32_t)file_size)
                        ? 3                        // END
                        : (is_compressed ? 5 : 0); // DATA
-        strcpy(pkt.filename, filename_str);
+        strcpy(pkt.filename, filename.c_str());
         pkt.file_size = file_size;
         pkt.chunk_offset = current_offset;
         pkt.crc32 = calculate_crc32((unsigned char *)compressed_data, compressed_len);
@@ -156,15 +157,15 @@ void *sender_thread(void *arg)
             chunk_offset += bytes_read;
             chunks_sent++;
             total_bytes_sent += bytes_read;
-            if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
-            {
+            // if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
+            // {
 
-                cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
-                     << "] Seq=" << pkt.seq_num
-                     << " offset=" << current_offset
-                     << " bytes=" << bytes_read
-                     << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
-            }
+            //     cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
+            //          << "] Seq=" << pkt.seq_num
+            //          << " offset=" << current_offset
+            //          << " bytes=" << bytes_read
+            //          << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
+            // }
             pthread_mutex_unlock(&arq_mutex);
         }
         else
@@ -201,8 +202,8 @@ void *receiver_thread(void *arg)
                 arq.handle_ack(ack_pkt.ack_num);
                 acks_received++;
 
-                cout << " ACK for seq=" << ack_pkt.ack_num
-                     << " | in-flight=" << arq.get_in_flight_count() << endl;
+                // cout << " ACK for seq=" << ack_pkt.ack_num
+                //      << " | in-flight=" << arq.get_in_flight_count() << endl;
 
                 // Transfer done when all data sent and window fully drained
                 if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
@@ -248,8 +249,8 @@ void *timeout_thread(void *arg)
 
             if (ready)
             {
-                cout << "  Timeout! SR retransmitting only seq=" << timed_out_seq
-                     << " (not full window)" << endl;
+                // cout << "  Timeout! SR retransmitting only seq=" << timed_out_seq
+                //      << " (not full window)" << endl;
 
                 struct Packet pkt_send = retransmit_pkt;
                 serialize_packet(&pkt_send);
@@ -279,20 +280,20 @@ void *logger_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        Sleep(1000);
-        if (transfer_complete)
-            break;
+        // Sleep(1000);
+        //  if (transfer_complete)
+        //      break;
 
-        pthread_mutex_lock(&arq_mutex);
-        int in_flight = arq.get_in_flight_count();
-        int acks = acks_received;
-        int sent = chunks_sent;
-        // [CHANGED] Print SR window state snapshot instead of cwnd/RTT
-        arq.print_window_state();
-        pthread_mutex_unlock(&arq_mutex);
-
-        cout << "[LOGGER] InFlight=" << in_flight << "/" << SR_WINDOW_SIZE
-             << " | ACKs=" << acks << "/" << sent << endl;
+        // pthread_mutex_lock(&arq_mutex);
+        // int in_flight = arq.get_in_flight_count();
+        // int acks = acks_received;
+        // int sent = chunks_sent;
+        // // [CHANGED] Print SR window state snapshot instead of cwnd/RTT
+        // //arq.print_window_state();
+        // pthread_mutex_unlock(&arq_mutex);
+        continue;
+        // cout << "[LOGGER] InFlight=" << in_flight << "/" << SR_WINDOW_SIZE
+        //      << " | ACKs=" << acks << "/" << sent << endl;
     }
     return nullptr;
 }
@@ -320,6 +321,11 @@ int main(int argc, char *argv[])
     }
 
     filename_str = argv[1];
+    string filenames = filename_str;
+    // strcpy(filenames, filename_str);
+
+    filename = filenames.substr(filenames.find_last_of("/\\") + 1);
+    // Now 'filename' is just "tata-motor-IAR-2024-25.pdf"
     file_size = get_file_size(filename_str);
 
     if (file_size < 0)
@@ -342,7 +348,10 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 50 * 1000;
+    tv.tv_usec = 200 * 1000; //changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    int buffer_size = 16 * 1024 * 1024; // 16 MB
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
     addr_len = sizeof(server_addr);
@@ -367,7 +376,7 @@ int main(int argc, char *argv[])
     pthread_create(&t_sender, nullptr, sender_thread, nullptr);
     pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
     pthread_create(&t_timeout, nullptr, timeout_thread, nullptr);
-    pthread_create(&t_logger, nullptr, logger_thread, nullptr);
+    // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
     pthread_join(t_sender, nullptr);
     pthread_join(t_receiver, nullptr);

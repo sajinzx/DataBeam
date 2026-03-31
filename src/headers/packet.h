@@ -8,7 +8,7 @@
 
 #define PORT 12345
 #define DATA_SIZE 1000
-#define MAX_FILENAME 64
+#define MAX_FILENAME 50
 #define USERNAME_MAX 32
 
 struct Packet
