@@ -14,7 +14,7 @@
 #include <cstring>
 
 // Constants for Selective Repeat ARQ
-#define SR_WINDOW_SIZE 8         // Sliding window size (N=8)
+#define SR_WINDOW_SIZE 255       // Sliding window size (N=8)
 #define SR_PACKET_TIMEOUT_MS 500 // Individual packet timeout: 500ms
 #define SR_MAX_RETRANSMITS 5     // Max retransmit attempts per packet
 
