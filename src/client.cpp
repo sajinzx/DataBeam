@@ -36,7 +36,8 @@ int total_chunks;
 int chunks_sent = 0;
 int acks_received = 0;
 uint64_t total_bytes_sent = 0;
-
+int total_inflights = 0;
+int retransmissions = 0;
 volatile bool transfer_complete = false;
 
 // ----------------------------------------------------------------------------
@@ -203,8 +204,11 @@ void *receiver_thread(void *arg)
                 acks_received++;
 
                 // cout << " ACK for seq=" << ack_pkt.ack_num
-                //      << " | in-flight=" << arq.get_in_flight_count() << endl;
-
+                //     << " | in-flight=" <<   endl;
+                if (arq.get_in_flight_count() > 240)
+                {
+                    total_inflights++;
+                }
                 // Transfer done when all data sent and window fully drained
                 if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
                 {
@@ -244,6 +248,7 @@ void *timeout_thread(void *arg)
             pthread_mutex_lock(&arq_mutex);
             // [CHANGED] prepare_retransmit resets the timer, increments retry count,
             //           and returns false if max retransmits exceeded
+            retransmissions++;
             ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
             pthread_mutex_unlock(&arq_mutex);
 
@@ -266,7 +271,7 @@ void *timeout_thread(void *arg)
             }
         }
 
-        Sleep(5); // Poll every 5ms
+        Sleep(10); // Poll every 5ms
     }
     return nullptr;
 }
@@ -348,8 +353,8 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 200 * 1000; //changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
-    int buffer_size = 16 * 1024 * 1024; // 16 MB
+    tv.tv_usec = 200 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    int buffer_size = 32 * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -397,6 +402,7 @@ int main(int argc, char *argv[])
     cout << "   - ACKs received:            " << acks_received << endl;
     cout << "   - Elapsed time:             " << fixed << setprecision(2) << elapsed << "s" << endl;
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
-
+    cout << "   - Max in-flight packets:    " << total_inflights << endl;
+    cout << "   - Total retransmissions:    " << retransmissions << endl;
     return 0;
 }

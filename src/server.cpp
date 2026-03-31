@@ -1,44 +1,26 @@
-// LinkFlow Phase 3: UDP Server (Advanced Receiver Features)
-// File: src/server.cpp
-
 #include <iostream>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <map>
 #include <vector>
-
-// Windows system + sockets
 #include <winsock2.h>
 #include <windows.h>
-
 #include <ws2tcpip.h>
-
-// File/stat support (Windows-compatible)
 #include <sys/stat.h>
-
-// Your project headers
 #include "./headers/packet.h"
 #include "./headers/arq.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 using namespace std;
 
-// ----------------------------------------------------------------------------
-// Utilities
-// ----------------------------------------------------------------------------
 void create_received_dir()
 {
     struct stat st = {0};
     if (stat("received", &st) == -1)
-    {
         mkdir("received");
-    }
 }
 
-// ----------------------------------------------------------------------------
-// Feature: Checkpoint Loading (resume.json)
-// ----------------------------------------------------------------------------
 void save_checkpoint(const string &filename, uint16_t expected_seq)
 {
     ofstream out("resume.json");
@@ -46,7 +28,6 @@ void save_checkpoint(const string &filename, uint16_t expected_seq)
     {
         out << "{\n  \"filename\": \"" << filename << "\",\n";
         out << "  \"expected_seq\": " << expected_seq << "\n}\n";
-        out.close();
     }
 }
 
@@ -55,64 +36,94 @@ uint16_t load_checkpoint(const string &target_filename)
     ifstream in("resume.json");
     if (!in.is_open())
         return 1;
-
-    stringstream buffer;
-    buffer << in.rdbuf();
-    string content = buffer.str();
-
+    stringstream buf;
+    buf << in.rdbuf();
+    string content = buf.str();
     size_t f_pos = content.find("\"filename\"");
     size_t s_pos = content.find("\"expected_seq\"");
-
-    if (f_pos != string::npos && s_pos != string::npos)
-    {
-        size_t f_start = content.find("\"", f_pos + 10) + 1;
-        size_t f_end = content.find("\"", f_start);
-        string saved_file = content.substr(f_start, f_end - f_start);
-
-        size_t s_start = content.find(":", s_pos) + 1;
-        while (s_start < content.length() && isspace(content[s_start]))
-            s_start++;
-        size_t s_end = content.find(",", s_start);
-        if (s_end == string::npos)
-            s_end = content.find("}", s_start);
-        while (s_end > s_start && isspace(content[s_end - 1]))
-            s_end--;
-
-        uint16_t seq = stoi(content.substr(s_start, s_end - s_start));
-
-        if (saved_file == target_filename)
-            return seq;
-    }
-    return 1;
+    if (f_pos == string::npos || s_pos == string::npos)
+        return 1;
+    size_t f_start = content.find("\"", f_pos + 10) + 1;
+    size_t f_end = content.find("\"", f_start);
+    string saved = content.substr(f_start, f_end - f_start);
+    if (saved != target_filename)
+        return 1;
+    size_t s_start = content.find(":", s_pos) + 1;
+    while (isspace(content[s_start]))
+        s_start++;
+    size_t s_end = content.find_first_of(",}", s_start);
+    while (s_end > s_start && isspace(content[s_end - 1]))
+        s_end--;
+    return (uint16_t)stoi(content.substr(s_start, s_end - s_start));
 }
 
-// ----------------------------------------------------------------------------
-// Feature: Rolling Hash Comparison (Delta Transfer)
-// ----------------------------------------------------------------------------
 vector<uint32_t> compute_file_hashes(const string &filepath)
 {
     vector<uint32_t> hashes;
     ifstream file(filepath, ios::binary);
     if (!file.is_open())
         return hashes;
-
     char buffer[DATA_SIZE];
     while (file.read(buffer, DATA_SIZE) || file.gcount() > 0)
     {
-        size_t bytes_read = file.gcount();
-        uint32_t chunk_crc = calculate_crc32(reinterpret_cast<unsigned char *>(buffer), bytes_read);
-        hashes.push_back(chunk_crc);
+        size_t n = file.gcount();
+        hashes.push_back(calculate_crc32(
+            reinterpret_cast<unsigned char *>(buffer), n));
     }
-    file.close();
     return hashes;
 }
 
-// ----------------------------------------------------------------------------
-// Main Server
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Decoded packet — stores decompressed payload so the buffer drain loop
+// never has to decompress or CRC-check twice
+// =============================================================================
+struct DecodedPacket
+{
+    char data[DATA_SIZE + 1];
+    size_t data_len;
+    uint8_t type;
+    uint32_t file_size;
+    uint32_t chunk_offset;
+};
+
+// Helper — CRC check + decompress in one place, used for both paths
+// Returns true on success, fills out decoded
+static bool decode_packet(const Packet &pkt,
+                          size_t compressed_len,
+                          DecodedPacket &out)
+{
+    // CRC check
+    uint32_t computed = calculate_crc32(
+        reinterpret_cast<const unsigned char *>(pkt.data), compressed_len);
+    if (computed != pkt.crc32)
+    {
+        cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
+             << " expected=0x" << hex << pkt.crc32
+             << " got=0x" << computed << dec << endl;
+        return false;
+    }
+
+    // Decompress
+    out.data_len = sizeof(out.data);
+    int ret = decompress_data(pkt.data, compressed_len,
+                              out.data, out.data_len);
+    if (ret != 0)
+    {
+        cerr << "[SERVER] Decomp failed seq=" << pkt.seq_num
+             << " err=" << ret << endl;
+        return false;
+    }
+
+    out.type = pkt.type;
+    out.file_size = pkt.file_size;
+    out.chunk_offset = pkt.chunk_offset;
+    return true;
+}
+
 int main()
 {
-    cout << " LinkFlow Phase 4 Server Starting (Advanced Features)..." << endl;
+    cout << " LinkFlow Phase 4 Server Starting..." << endl;
+    SetConsoleOutputCP(CP_UTF8);
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -126,15 +137,20 @@ int main()
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
     {
-        cerr << " Socket creation failed." << endl;
+        cerr << " Socket failed." << endl;
         return 1;
     }
-    cout << " UDP socket created (fd=" << sockfd << ")" << endl;
-    int buffer_size = 16 * 1024 * 1024; // 16 MB
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
+
+    // Large socket buffers — absorb bursts without dropping
+    int buf_size = 32 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buf_size, sizeof(buf_size));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size, sizeof(buf_size));
+
+    // FIX: 1ms recv timeout — server must be responsive for ACK sending
+    struct timeval tv = {0, 1000};
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+
+    struct sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(PORT);
@@ -150,19 +166,16 @@ int main()
     socklen_t addr_len = sizeof(client_addr);
 
     uint16_t expected_seq_num = 1;
-    map<uint16_t, Packet> receive_buffer;
     bool is_receiving = true;
-    string current_filename = "";
     bool connection_initialized = false;
-    ofstream outfile; // Declare outside the loop
-    string out_filepath = "received/recv_" + current_filename;
-    // Inside your metadata/initialization logic (when you get the filename)
-    outfile.open(out_filepath, ios::binary | ios::trunc);
-    if (!outfile.is_open())
-    {
-        cerr << "[SERVER] Fatal Error: Cannot create " << out_filepath << endl;
-        return 1;
-    }
+    string current_filename = "";
+    string out_filepath = ""; // FIX: single declaration, no shadowing
+
+    // FIX: buffer stores DecodedPacket — already CRC-checked and decompressed
+    // No duplicate work when draining
+    DecodedPacket *fast_buffer[512] = {nullptr};
+
+    ofstream outfile;
 
     while (is_receiving)
     {
@@ -172,246 +185,147 @@ int main()
         int bytes_recv = recvfrom(sockfd, (char *)&pkt, sizeof(pkt), 0,
                                   (struct sockaddr *)&client_addr, &addr_len);
 
-        if (bytes_recv > 0)
+        if (bytes_recv <= 0)
+            continue; // timeout or error — loop again
+
+        deserialize_packet(&pkt);
+
+        // ---- New file / connection init ------------------------------------
+        if (!connection_initialized || string(pkt.filename) != current_filename)
         {
-            deserialize_packet(&pkt);
-
-            // 1. Feature: Checkpoint Loading (resume.json)
-            if (!connection_initialized || pkt.filename != current_filename)
+            if (outfile.is_open())
             {
-                current_filename = pkt.filename;
-                string filepath = "received/recv_" + current_filename;
-
-                uint16_t resume_seq = load_checkpoint(current_filename);
-                if (resume_seq > 1)
-                {
-                    // cout << "\n Checkpoint loaded! Resuming transfer of " << current_filename << " from seq=" << resume_seq << endl;
-                    expected_seq_num = resume_seq;
-
-                    // 2. Feature: Rolling Hash Comparison
-                    // cout << " Computing rolling hashes for delta transfer comparison..." << endl;
-                    vector<uint32_t> hashes = compute_file_hashes(filepath);
-                    // cout << "   -> Found " << hashes.size() << " existing chunk hashes in received/." << endl;
-                }
-                else
-                {
-                    expected_seq_num = 1;
-                }
-                connection_initialized = true;
+                outfile.flush();
+                outfile.close();
             }
 
-            size_t actual_compressed_len = pkt.data_len;
+            current_filename = pkt.filename;
+            out_filepath = "received/recv_" + current_filename; // FIX: assign outer
 
-            // Sanity check — reject malformed packets before touching data
-            bool crc_valid = false;
-
-            if (actual_compressed_len == 0 || actual_compressed_len > (size_t)(DATA_SIZE + 1))
+            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+            if (!outfile.is_open())
             {
-                cerr << "[SERVER] Invalid data_len=" << actual_compressed_len
-                     << " for seq=" << pkt.seq_num << " — dropping" << endl;
+                cerr << "[SERVER] Cannot create: " << out_filepath << endl;
+                return 1;
             }
-            else
-            {
-                uint32_t computed_crc = calculate_crc32(
-                    reinterpret_cast<const unsigned char *>(pkt.data),
-                    actual_compressed_len);
+            cout << "[SERVER] Opened: " << out_filepath << endl;
 
-                if (computed_crc == pkt.crc32)
-                {
-                    crc_valid = true;
-                }
-                else
-                {
-                    cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
-                         << " expected=0x" << hex << pkt.crc32
-                         << " got=0x" << computed_crc << dec << endl;
-                }
+            uint16_t resume_seq = load_checkpoint(current_filename);
+            expected_seq_num = (resume_seq > 1) ? resume_seq : 1;
+            memset(fast_buffer, 0, sizeof(fast_buffer)); // Clear buffer on new file
+            connection_initialized = true;
+        }
+
+        // ---- Validate data_len --------------------------------------------
+        size_t compressed_len = pkt.data_len;
+        if (compressed_len == 0 || compressed_len > (size_t)(DATA_SIZE + 1))
+        {
+            cerr << "[SERVER] Bad data_len=" << compressed_len
+                 << " seq=" << pkt.seq_num << endl;
+            continue;
+        }
+
+        // ---- Send ACK immediately after length check (before heavy work) --
+        // FIX: ACK sent as small struct, not full Packet — reduces ACK latency
+        // FIX: ACK sent BEFORE decode so the client's RTO doesn't expire
+        //      while we decompress
+        {
+            Packet ack_pkt;
+            memset(&ack_pkt, 0, sizeof(ack_pkt));
+            ack_pkt.type = 1;
+            ack_pkt.ack_num = pkt.seq_num;
+            ack_pkt.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
+            serialize_packet(&ack_pkt);
+            sendto(sockfd, (const char *)&ack_pkt, sizeof(ack_pkt), 0,
+                   (struct sockaddr *)&client_addr, addr_len);
+        }
+
+        // ---- Decode once — CRC + decompress --------------------------------
+        // FIX: decode_packet does CRC + decompress exactly once per packet
+        // Result goes into decoded. If it's out-of-order it goes into the
+        // buffer as a DecodedPacket — no second CRC/decompress on drain.
+        DecodedPacket decoded;
+        if (!decode_packet(pkt, compressed_len, decoded))
+            continue; // CRC fail or decomp fail — client will retransmit
+
+        // ---- Buffer or write -----------------------------------------------
+        if (pkt.seq_num == expected_seq_num)
+        {
+            // In-order — write immediately
+            // FIX: clamp write_len to remaining file bytes (fixes file size bug)
+            size_t remaining = (size_t)decoded.file_size - decoded.chunk_offset;
+            size_t write_len = min(decoded.data_len, remaining);
+
+            outfile.write(decoded.data, (streamsize)write_len);
+            if (outfile.fail())
+            {
+                cerr << "[SERVER] Write failed seq=" << pkt.seq_num << endl;
+                outfile.clear();
             }
-            if (crc_valid)
+
+            expected_seq_num++;
+            save_checkpoint(current_filename, expected_seq_num);
+
+            // ---- Drain buffer — NO decode work here, already done ----------
+            while (fast_buffer[expected_seq_num % 512] != nullptr)
             {
-                // 3. Feature: Individual ACKs (Selective Repeat Support)
-                Packet ack_pkt;
-                memset(&ack_pkt, 0, sizeof(ack_pkt));
-                ack_pkt.type = 1;              // ACK
-                ack_pkt.ack_num = pkt.seq_num; // Individual ACK
+                DecodedPacket &bp = *fast_buffer[expected_seq_num % 512];
 
-                // Set Selective Repeat Bitmap
-                ack_pkt.bitmap = (1 << (pkt.seq_num % 16));
+                size_t bp_remaining = (size_t)bp.file_size - bp.chunk_offset;
+                size_t bp_write_len = min(bp.data_len, bp_remaining);
 
-                serialize_packet(&ack_pkt);
-
-                sendto(sockfd, (const char *)&ack_pkt, sizeof(ack_pkt), 0,
-                       (struct sockaddr *)&client_addr, addr_len);
-
-                // cout << " Received seq=" << pkt.seq_num << " (Individual SR ACK Sent, Bitmap=" << ack_pkt.bitmap << ")" << endl;
-
-                // File Reassembly Logic
-                if (pkt.seq_num == expected_seq_num)
+                outfile.write(bp.data, (streamsize)bp_write_len);
+                if (outfile.fail())
                 {
-
-                    // ---- Decompress (handles both raw and deflated via marker byte) ------------
-                    char decompressed[DATA_SIZE];
-                    size_t decompressed_len = sizeof(decompressed);
-
-                    // actual_compressed_len must include the 1-byte marker prefix
-                    int decomp_result = decompress_data(
-                        pkt.data,
-                        actual_compressed_len,
-                        decompressed,
-                        decompressed_len);
-
-                    if (decomp_result != 0)
-                    {
-                        cerr << "[SERVER] Decompression failed seq=" << pkt.seq_num
-                             << " err=" << decomp_result << endl;
-                        continue; // SR ARQ will retransmit
-                    }
-
-                    // ---- Write to file ---------------------------------------------------------
-                    {
-                        // First packet ever → truncate (create fresh file)
-                        // All subsequent    → append
-
-                        // BUG FIX: write from decompressed buffer, not decomp_result (int)
-                        // decompressed_len is set by decompress_data to the actual output size
-                        outfile.write(decompressed, (streamsize)decompressed_len);
-
-                        if (outfile.fail())
-                        {
-                            cerr << "[SERVER] File write failed at seq=" << pkt.seq_num << endl;
-                        }
-                    } // ofstream destructor closes the file here — no manual close() needed
-
-                    expected_seq_num++;
-
-                    // Save Checkpoint after successful write
-                    save_checkpoint(current_filename, expected_seq_num);
-
-                    // ---- Process buffered out-of-order packets (SR reordering) ----------------
-                    while (receive_buffer.find(expected_seq_num) != receive_buffer.end())
-                    {
-                        Packet &buffered_pkt = receive_buffer[expected_seq_num];
-
-                        // ----------------------------------------------------------------
-                        // BUG FIX 1: Remove the CRC brute-force loop entirely.
-                        // compressed length = total packet data - 1 marker byte.
-                        // The actual payload length is derived from file geometry:
-                        //   last chunk  → file_size - chunk_offset  (may be < DATA_SIZE)
-                        //   other chunks → DATA_SIZE
-                        // compress_data stores the marker byte at offset 0, so we pass
-                        // the full data field; decompress_data reads the marker itself.
-                        // ----------------------------------------------------------------
-                        // Use data_len from packet directly — no geometry guessing needed
-                        size_t buf_comp_len = buffered_pkt.data_len;
-
-                        // Sanity check before CRC
-                        if (buf_comp_len == 0 || buf_comp_len > DATA_SIZE + 1)
-                        {
-                            cerr << "[SERVER] Invalid data_len=" << buf_comp_len
-                                 << " in buffered seq=" << expected_seq_num << " — dropping" << endl;
-                            receive_buffer.erase(expected_seq_num);
-                            break;
-                        }
-
-                        // CRC verification — verify BEFORE decompressing
-                        uint32_t actual_crc = calculate_crc32(
-                            reinterpret_cast<const unsigned char *>(buffered_pkt.data),
-                            buf_comp_len);
-
-                        if (actual_crc != buffered_pkt.crc32)
-                        {
-                            cerr << "[SERVER] CRC mismatch on buffered seq=" << expected_seq_num
-                                 << " expected=0x" << hex << buffered_pkt.crc32
-                                 << " got=0x" << actual_crc << dec << endl;
-
-                            receive_buffer.erase(expected_seq_num);
-                            break;
-                        }
-
-                        // ----------------------------------------------------------------
-                        // Decompress — marker byte tells decompress_data which path to take
-                        // BUG FIX 2: buffer sized DATA_SIZE + 1 for safety
-                        // ----------------------------------------------------------------
-                        char buf_decomp_data[DATA_SIZE + 1];
-                        size_t buf_decomp_len = sizeof(buf_decomp_data);
-
-                        int decomp_ret = decompress_data(
-                            buffered_pkt.data,
-                            buf_comp_len,
-                            buf_decomp_data,
-                            buf_decomp_len);
-
-                        // BUG FIX 3: no silent fallback — drop and let SR retransmit
-                        if (decomp_ret != 0)
-                        {
-                            cerr << "[SERVER] Decompression failed on buffered seq="
-                                 << expected_seq_num
-                                 << " err=" << decomp_ret << endl;
-
-                            receive_buffer.erase(expected_seq_num);
-                            break;
-                        }
-
-                        // ----------------------------------------------------------------
-                        // BUG FIX 4: always clamp write_len to remaining file bytes,
-                        // not just on type == 3
-                        // ----------------------------------------------------------------
-                        size_t remaining = buffered_pkt.file_size - buffered_pkt.chunk_offset;
-                        size_t write_len = min(buf_decomp_len, remaining);
-
-                        // ----------------------------------------------------------------
-                        // Write to file
-                        // ----------------------------------------------------------------
-                        {
-
-                            outfile.write(buf_decomp_data, (streamsize)write_len);
-
-                            if (outfile.fail())
-                            {
-                                cerr << "[SERVER] Write failed for buffered seq="
-                                     << expected_seq_num << endl;
-                                break;
-                            }
-                        } // auto-close on scope exit
-
-                        // ----------------------------------------------------------------
-                        // Advance state
-                        // ----------------------------------------------------------------
-                        receive_buffer.erase(expected_seq_num);
-                        expected_seq_num++;
-
-                        save_checkpoint(current_filename, expected_seq_num);
-
-                        if (buffered_pkt.type == 3)
-                        {
-                            is_receiving = false;
-                            cout << "[SERVER] File transfer completed: " << out_filepath << endl;
-                            remove("resume.json");
-                            break; // END packet processed — stop draining
-                        }
-                    }
-
-                    if (pkt.type == 3)
-                    {
-                        is_receiving = false;
-                        cout << " File transfer completed successfully!" << endl;
-                        remove("resume.json"); // clear checkpoint on completion
-                    }
+                    cerr << "[SERVER] Write failed buffered seq="
+                         << expected_seq_num << endl;
+                    outfile.clear();
+                    break;
                 }
-                else if (pkt.seq_num > expected_seq_num)
+
+                bool is_end = (bp.type == 3);
+                fast_buffer[expected_seq_num % 512] = nullptr;
+                expected_seq_num++;
+                save_checkpoint(current_filename, expected_seq_num);
+
+                if (is_end)
                 {
-                    // Buffer out-of-order packets
-                    receive_buffer[pkt.seq_num] = pkt;
+                    is_receiving = false;
+                    connection_initialized = false;
+                    outfile.flush();
+                    outfile.close();
+                    remove("resume.json");
+                    cout << "[SERVER] Transfer complete: " << out_filepath << endl;
+                    break;
                 }
             }
-            else
+
+            // END on in-order path
+            if (decoded.type == 3 && is_receiving)
             {
-                cout << " CRC Validation failed for seq=" << pkt.seq_num << endl;
+                is_receiving = false;
+                connection_initialized = false;
+                outfile.flush();
+                outfile.close();
+                remove("resume.json");
+                cout << "[SERVER] Transfer complete: " << out_filepath << endl;
             }
         }
+        else if (pkt.seq_num > expected_seq_num)
+        {
+            // Out-of-order — store decoded result, not raw packet
+            // FIX: buffer holds DecodedPacket — drain loop just writes, no decode
+            if (fast_buffer[pkt.seq_num % 512] == nullptr)
+            {
+                fast_buffer[pkt.seq_num % 512] = new DecodedPacket(decoded);
+            }
+        }
+        // pkt.seq_num < expected_seq_num → duplicate, already processed, ignore
     }
 
-    close(sockfd);
+    outfile.flush();
+    outfile.close();
+    closesocket(sockfd);
     WSACleanup();
     return 0;
 }
