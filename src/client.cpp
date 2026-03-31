@@ -195,33 +195,40 @@ void *receiver_thread(void *arg)
         if (bytes_recv > 0)
         {
             deserialize_packet(&ack_pkt);
-
-            if (ack_pkt.type == 1) // ACK
+            uint32_t computed = calculate_crc32(reinterpret_cast<const unsigned char *>(ack_pkt.data), sizeof(ACKPacket) - sizeof(uint32_t));
+            if (computed == ack_pkt.crc32)
             {
-                pthread_mutex_lock(&arq_mutex);
-                // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
-                arq.handle_ack(ack_pkt.ack_num);
-                acks_received++;
+                if (ack_pkt.type == 1) // ACK
+                {
+                    pthread_mutex_lock(&arq_mutex);
+                    // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
+                    arq.handle_ack(ack_pkt.ack_num);
+                    acks_received++;
 
-                // cout << " ACK for seq=" << ack_pkt.ack_num
-                //     << " | in-flight=" <<   endl;
-                if (arq.get_in_flight_count() > 1000)
-                {
-                    total_inflights++;
+                    // cout << " ACK for seq=" << ack_pkt.ack_num
+                    //     << " | in-flight=" <<   endl;
+                    if (arq.get_in_flight_count() > 1000)
+                    {
+                        total_inflights++;
+                    }
+                    // Transfer done when all data sent and window fully drained
+                    if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+                    {
+                        transfer_complete = true;
+                    }
+                    pthread_mutex_unlock(&arq_mutex);
                 }
-                // Transfer done when all data sent and window fully drained
-                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
-                {
-                    transfer_complete = true;
-                }
-                pthread_mutex_unlock(&arq_mutex);
             }
+            else
+            {
+                cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack->ack_num << endl;
+                // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
+            }
+            // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
         }
-        // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
+        return nullptr;
     }
-    return nullptr;
 }
-
 // ----------------------------------------------------------------------------
 // Thread 3: Timeout Thread
 // [CHANGED] SR checks timeouts per-packet and retransmits only the timed-out

@@ -365,13 +365,14 @@ int main()
             continue; // don't ACK — client will retransmit
         }
         {
-            Packet ack_pkt;
-            memset(&ack_pkt, 0, sizeof(ack_pkt));
-            ack_pkt.type = 1;
-            ack_pkt.ack_num = pkt.seq_num;
-            ack_pkt.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
-            serialize_packet(&ack_pkt);
-            sendto(sockfd, (const char *)&ack_pkt, sizeof(ack_pkt), 0,
+            ACKPacket small_ack;
+            small_ack.type = 1;
+            small_ack.ack_num = pkt.seq_num;
+            small_ack.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
+            small_ack.crc32 = calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4);
+
+            serialize_packet(&small_ack);
+            sendto(sockfd, (const char *)&small_ack, sizeof(small_ack), 0,
                    (struct sockaddr *)&client_addr, addr_len);
         }
         {

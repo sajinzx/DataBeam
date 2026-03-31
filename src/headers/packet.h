@@ -7,10 +7,16 @@
 #include <ws2tcpip.h>
 
 #define PORT 12345
-#define DATA_SIZE 1000
+#define DATA_SIZE 1024
 #define MAX_FILENAME 50
 #define USERNAME_MAX 32
-
+struct ACKPacket
+{
+    uint32_t ack_num; // The sequence number being acknowledged
+    uint16_t bitmap;  // For Selective Repeat (which neighbors are also here)
+    uint8_t type;     // Always set to 1 (ACK)
+    uint32_t crc32;   // Integrity check for the ACK itself
+};
 struct Packet
 {
     // CORE (Phase 1-2)
