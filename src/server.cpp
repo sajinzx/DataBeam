@@ -367,11 +367,11 @@ int main()
         {
             ACKPacket small_ack;
             small_ack.type = 1;
-            small_ack.ack_num = pkt.seq_num;
-            small_ack.bitmap = (uint16_t)(1u << (pkt.seq_num % 16));
-            small_ack.crc32 = calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4);
+            small_ack.ack_num = htons(pkt.seq_num);
+            small_ack.bitmap = htons((uint16_t)(1u << (pkt.seq_num % 16)));
+            small_ack.crc32 = htonl(calculate_crc32((unsigned char *)&small_ack, sizeof(small_ack) - 4));
 
-            serialize_packet(&small_ack);
+            // serialize_packet(&small_ack);
             sendto(sockfd, (const char *)&small_ack, sizeof(small_ack), 0,
                    (struct sockaddr *)&client_addr, addr_len);
         }

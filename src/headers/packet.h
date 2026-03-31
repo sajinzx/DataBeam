@@ -26,8 +26,8 @@ struct Packet
 
     // ERROR DETECTION (Phase 2)
     uint32_t crc32;    // CRC32 checksum
-    uint8_t parity;    // Simple parity bit
-    uint16_t checksum; // Internet checksum
+                       // uint8_t parity;    // Simple parity bit
+                       // uint16_t checksum; // Internet checksum
     uint16_t data_len; // Actual data length in this packet
     // FILE TRANSFER (Phase 2)
     uint32_t file_size;          // Total file bytes
@@ -44,8 +44,8 @@ struct Packet
     uint8_t iv[16];   // AES initialization vector
 
     // ADVANCED (Phase 5+)
-    uint8_t fec_parity; // Forward error correction
-    uint16_t bitmap;    // Selective Repeat bitmap
+    // uint8_t fec_parity; // Forward error correction
+    uint16_t bitmap; // Selective Repeat bitmap
 
     // METADATA
     char username[USERNAME_MAX]; // "john_doe"
@@ -63,7 +63,7 @@ inline void serialize_packet(struct Packet *pkt)
     pkt->file_size = htonl(pkt->file_size);
     pkt->data_len = htons(pkt->data_len);
     pkt->chunk_offset = htonl(pkt->chunk_offset);
-    pkt->checksum = htons(pkt->checksum);
+    //pkt->checksum = htons(pkt->checksum);
     pkt->rtt_sample = htons(pkt->rtt_sample);
 }
 
@@ -76,7 +76,7 @@ inline void deserialize_packet(struct Packet *pkt)
     pkt->file_size = ntohl(pkt->file_size);
     pkt->data_len = ntohs(pkt->data_len);
     pkt->chunk_offset = ntohl(pkt->chunk_offset);
-    pkt->checksum = ntohs(pkt->checksum);
+    //pkt->checksum = ntohs(pkt->checksum);
     pkt->rtt_sample = ntohs(pkt->rtt_sample);
 }
 

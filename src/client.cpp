@@ -186,48 +186,46 @@ void *receiver_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        struct Packet ack_pkt;
-        memset(&ack_pkt, 0, sizeof(ack_pkt));
+        struct ACKPacket ack_pkt;
+        // memset(&ack_pkt, 0, sizeof(ack_pkt));
 
         int bytes_recv = recvfrom(sockfd, (char *)&ack_pkt, sizeof(ack_pkt), 0,
                                   (struct sockaddr *)&server_addr, &addr_len);
 
         if (bytes_recv > 0)
         {
-            deserialize_packet(&ack_pkt);
-            uint32_t computed = calculate_crc32(reinterpret_cast<const unsigned char *>(ack_pkt.data), sizeof(ACKPacket) - sizeof(uint32_t));
-            if (computed == ack_pkt.crc32)
+            // deserialize_packet(&ack_pkt);
+            uint32_t computed = calculate_crc32(reinterpret_cast<const unsigned char *>(&ack_pkt), sizeof(ACKPacket) - sizeof(uint32_t));
+            if (computed == ntohl(ack_pkt.crc32))
             {
-                if (ack_pkt.type == 1) // ACK
-                {
-                    pthread_mutex_lock(&arq_mutex);
-                    // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
-                    arq.handle_ack(ack_pkt.ack_num);
-                    acks_received++;
 
-                    // cout << " ACK for seq=" << ack_pkt.ack_num
-                    //     << " | in-flight=" <<   endl;
-                    if (arq.get_in_flight_count() > 1000)
-                    {
-                        total_inflights++;
-                    }
-                    // Transfer done when all data sent and window fully drained
-                    if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
-                    {
-                        transfer_complete = true;
-                    }
-                    pthread_mutex_unlock(&arq_mutex);
+                pthread_mutex_lock(&arq_mutex);
+                // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
+                arq.handle_ack(ntohs(ack_pkt.ack_num));
+                acks_received++;
+
+                // cout << " ACK for seq=" << ack_pkt.ack_num
+                //     << " | in-flight=" <<   endl;
+                if (arq.get_in_flight_count() > 1000)
+                {
+                    total_inflights++;
                 }
+                // Transfer done when all data sent and window fully drained
+                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
+                {
+                    transfer_complete = true;
+                }
+                pthread_mutex_unlock(&arq_mutex);
             }
             else
             {
-                cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack->ack_num << endl;
+                // cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ntohs(ack_pkt.ack_num) << endl;
                 // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
             }
             // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
         }
-        return nullptr;
     }
+    return nullptr;
 }
 // ----------------------------------------------------------------------------
 // Thread 3: Timeout Thread
