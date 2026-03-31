@@ -29,9 +29,9 @@ struct Packet
     char filename[MAX_FILENAME]; // "document.pdf"
 
     // PERFORMANCE (Phase 2.5-5)
-    uint8_t stream_id;   // Multi-connection (0-3)
-    uint8_t window_size; // Go-Back-N window
-    uint16_t rtt_sample; // Congestion control
+    uint8_t stream_id;    // Multi-connection (0-3)
+    uint16_t window_size; // Go-Back-N window
+    uint16_t rtt_sample;  // Congestion control
 
     // SECURITY (Phase 7)
     uint8_t hmac[32]; // Message authentication

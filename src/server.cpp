@@ -8,11 +8,25 @@
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <sys/stat.h>
+#include <queue>
+#include <pthread.h>
 #include "./headers/packet.h"
 #include "./headers/arq.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 using namespace std;
+
+// Work queue — holds CRC-verified raw packets waiting to be decompressed
+struct WorkItem
+{
+    Packet pkt;
+    size_t compressed_len;
+};
+
+queue<WorkItem> work_queue;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+volatile bool server_done = false;
 
 void create_received_dir()
 {
@@ -86,40 +100,145 @@ struct DecodedPacket
     uint32_t chunk_offset;
 };
 
-// Helper — CRC check + decompress in one place, used for both paths
-// Returns true on success, fills out decoded
-static bool decode_packet(const Packet &pkt,
-                          size_t compressed_len,
-                          DecodedPacket &out)
+void *worker_thread(void *arg)
 {
-    // CRC check
-    uint32_t computed = calculate_crc32(
-        reinterpret_cast<const unsigned char *>(pkt.data), compressed_len);
-    if (computed != pkt.crc32)
+    // All file state lives here — only this thread touches the file
+    map<uint16_t, DecodedPacket> receive_buffer;
+    ofstream outfile;
+    string out_filepath = "";
+    string current_filename = "";
+    uint16_t expected_seq_num = 1;
+    bool connection_init = false;
+
+    while (!server_done)
     {
-        cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
-             << " expected=0x" << hex << pkt.crc32
-             << " got=0x" << computed << dec << endl;
-        return false;
+        // ---- Pop from queue ------------------------------------------------
+        WorkItem item;
+        {
+            pthread_mutex_lock(&queue_mutex);
+            while (work_queue.empty() && !server_done)
+                pthread_cond_wait(&queue_cond, &queue_mutex);
+            if (server_done && work_queue.empty())
+            {
+                pthread_mutex_unlock(&queue_mutex);
+                break;
+            }
+            item = work_queue.front();
+            work_queue.pop();
+            pthread_mutex_unlock(&queue_mutex);
+        }
+
+        Packet &pkt = item.pkt;
+
+        // ---- File init (mirrors network thread logic) ----------------------
+        if (!connection_init || string(pkt.filename) != current_filename)
+        {
+            if (outfile.is_open())
+            {
+                outfile.flush();
+                outfile.close();
+            }
+            current_filename = pkt.filename;
+            out_filepath = "received/recv_" + current_filename;
+            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+            if (!outfile.is_open())
+            {
+                cerr << "[WORKER] Cannot create: " << out_filepath << endl;
+                continue;
+            }
+            expected_seq_num = 1;
+            receive_buffer.clear();
+            connection_init = true;
+        }
+
+        // ---- Decompress ----------------------------------------------------
+        DecodedPacket decoded;
+        decoded.data_len = sizeof(decoded.data);
+        int ret = decompress_data(pkt.data, item.compressed_len,
+                                  decoded.data, decoded.data_len);
+        if (ret != 0)
+        {
+            // This should never happen — CRC passed in network thread
+            // meaning data arrived intact. If decompress fails here
+            // it means compress_data produced data that decompress_data
+            // can't handle — that's a compress.h bug, not a network bug.
+            cerr << "[WORKER] Decomp failed seq=" << pkt.seq_num
+                 << " err=" << ret << endl;
+            continue;
+        }
+
+        decoded.type = pkt.type;
+        decoded.file_size = pkt.file_size;
+        decoded.chunk_offset = pkt.chunk_offset;
+
+        // ---- Buffer or write (same logic as before) ------------------------
+        if (pkt.seq_num == expected_seq_num)
+        {
+            size_t remaining = (size_t)decoded.file_size - decoded.chunk_offset;
+            size_t write_len = min(decoded.data_len, remaining);
+
+            outfile.write(decoded.data, (streamsize)write_len);
+            if (outfile.fail())
+            {
+                cerr << "[WORKER] Write failed seq=" << pkt.seq_num << endl;
+                outfile.clear();
+            }
+
+            expected_seq_num++;
+            save_checkpoint(current_filename, expected_seq_num);
+
+            // Drain buffer
+            while (receive_buffer.count(expected_seq_num))
+            {
+                DecodedPacket &bp = receive_buffer[expected_seq_num];
+                size_t bp_remaining = (size_t)bp.file_size - bp.chunk_offset;
+                size_t bp_write_len = min(bp.data_len, bp_remaining);
+
+                outfile.write(bp.data, (streamsize)bp_write_len);
+                if (outfile.fail())
+                {
+                    cerr << "[WORKER] Write failed buffered seq="
+                         << expected_seq_num << endl;
+                    outfile.clear();
+                    break;
+                }
+
+                bool is_end = (bp.type == 3);
+                receive_buffer.erase(expected_seq_num);
+                expected_seq_num++;
+                save_checkpoint(current_filename, expected_seq_num);
+
+                if (is_end)
+                {
+                    outfile.flush();
+                    outfile.close();
+                    connection_init = false;
+                    remove("resume.json");
+                    cout << "[WORKER] Transfer complete: " << out_filepath << endl;
+                    server_done = true;
+                    break;
+                }
+            }
+
+            if (decoded.type == 3 && outfile.is_open())
+            {
+                outfile.flush();
+                outfile.close();
+                connection_init = false;
+                remove("resume.json");
+                cout << "[WORKER] Transfer complete: " << out_filepath << endl;
+                server_done = true;
+            }
+        }
+        else if (pkt.seq_num > expected_seq_num)
+        {
+            if (!receive_buffer.count(pkt.seq_num))
+                receive_buffer[pkt.seq_num] = decoded;
+        }
     }
 
-    // Decompress
-    out.data_len = sizeof(out.data);
-    int ret = decompress_data(pkt.data, compressed_len,
-                              out.data, out.data_len);
-    if (ret != 0)
-    {
-        cerr << "[SERVER] Decomp failed seq=" << pkt.seq_num
-             << " err=" << ret << endl;
-        return false;
-    }
-
-    out.type = pkt.type;
-    out.file_size = pkt.file_size;
-    out.chunk_offset = pkt.chunk_offset;
-    return true;
+    return nullptr;
 }
-
 int main()
 {
     cout << " LinkFlow Phase 4 Server Starting..." << endl;
@@ -176,7 +295,8 @@ int main()
     DecodedPacket *fast_buffer[512] = {nullptr};
 
     ofstream outfile;
-
+    pthread_t t_worker;
+    pthread_create(&t_worker, nullptr, worker_thread, nullptr);
     while (is_receiving)
     {
         Packet pkt;
@@ -229,6 +349,18 @@ int main()
         // FIX: ACK sent as small struct, not full Packet — reduces ACK latency
         // FIX: ACK sent BEFORE decode so the client's RTO doesn't expire
         //      while we decompress
+        // ---- CRC check — must pass before ACK ------------------------------------
+        uint32_t computed = calculate_crc32(
+            reinterpret_cast<const unsigned char *>(pkt.data),
+            compressed_len);
+
+        if (computed != pkt.crc32)
+        {
+            cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num
+                 << " expected=0x" << hex << pkt.crc32
+                 << " got=0x" << computed << dec << endl;
+            continue; // don't ACK — client will retransmit
+        }
         {
             Packet ack_pkt;
             memset(&ack_pkt, 0, sizeof(ack_pkt));
@@ -239,90 +371,22 @@ int main()
             sendto(sockfd, (const char *)&ack_pkt, sizeof(ack_pkt), 0,
                    (struct sockaddr *)&client_addr, addr_len);
         }
-
-        // ---- Decode once — CRC + decompress --------------------------------
-        // FIX: decode_packet does CRC + decompress exactly once per packet
-        // Result goes into decoded. If it's out-of-order it goes into the
-        // buffer as a DecodedPacket — no second CRC/decompress on drain.
-        DecodedPacket decoded;
-        if (!decode_packet(pkt, compressed_len, decoded))
-            continue; // CRC fail or decomp fail — client will retransmit
-
-        // ---- Buffer or write -----------------------------------------------
-        if (pkt.seq_num == expected_seq_num)
         {
-            // In-order — write immediately
-            // FIX: clamp write_len to remaining file bytes (fixes file size bug)
-            size_t remaining = (size_t)decoded.file_size - decoded.chunk_offset;
-            size_t write_len = min(decoded.data_len, remaining);
+            WorkItem item;
+            item.pkt = pkt;
+            item.compressed_len = compressed_len;
 
-            outfile.write(decoded.data, (streamsize)write_len);
-            if (outfile.fail())
-            {
-                cerr << "[SERVER] Write failed seq=" << pkt.seq_num << endl;
-                outfile.clear();
-            }
-
-            expected_seq_num++;
-            save_checkpoint(current_filename, expected_seq_num);
-
-            // ---- Drain buffer — NO decode work here, already done ----------
-            while (fast_buffer[expected_seq_num % 512] != nullptr)
-            {
-                DecodedPacket &bp = *fast_buffer[expected_seq_num % 512];
-
-                size_t bp_remaining = (size_t)bp.file_size - bp.chunk_offset;
-                size_t bp_write_len = min(bp.data_len, bp_remaining);
-
-                outfile.write(bp.data, (streamsize)bp_write_len);
-                if (outfile.fail())
-                {
-                    cerr << "[SERVER] Write failed buffered seq="
-                         << expected_seq_num << endl;
-                    outfile.clear();
-                    break;
-                }
-
-                bool is_end = (bp.type == 3);
-                fast_buffer[expected_seq_num % 512] = nullptr;
-                expected_seq_num++;
-                save_checkpoint(current_filename, expected_seq_num);
-
-                if (is_end)
-                {
-                    is_receiving = false;
-                    connection_initialized = false;
-                    outfile.flush();
-                    outfile.close();
-                    remove("resume.json");
-                    cout << "[SERVER] Transfer complete: " << out_filepath << endl;
-                    break;
-                }
-            }
-
-            // END on in-order path
-            if (decoded.type == 3 && is_receiving)
-            {
-                is_receiving = false;
-                connection_initialized = false;
-                outfile.flush();
-                outfile.close();
-                remove("resume.json");
-                cout << "[SERVER] Transfer complete: " << out_filepath << endl;
-            }
+            pthread_mutex_lock(&queue_mutex);
+            work_queue.push(item);
+            pthread_cond_signal(&queue_cond); // wake worker thread
+            pthread_mutex_unlock(&queue_mutex);
         }
-        else if (pkt.seq_num > expected_seq_num)
-        {
-            // Out-of-order — store decoded result, not raw packet
-            // FIX: buffer holds DecodedPacket — drain loop just writes, no decode
-            if (fast_buffer[pkt.seq_num % 512] == nullptr)
-            {
-                fast_buffer[pkt.seq_num % 512] = new DecodedPacket(decoded);
-            }
-        }
+
         // pkt.seq_num < expected_seq_num → duplicate, already processed, ignore
     }
-
+    server_done = true;
+    pthread_cond_signal(&queue_cond); // wake worker if it's waiting
+    pthread_join(t_worker, nullptr);
     outfile.flush();
     outfile.close();
     closesocket(sockfd);

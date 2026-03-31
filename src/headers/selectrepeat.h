@@ -14,9 +14,9 @@
 #include <cstring>
 
 // Constants for Selective Repeat ARQ
-#define SR_WINDOW_SIZE 255       // Sliding window size (N=8)
-#define SR_PACKET_TIMEOUT_MS 500 // Individual packet timeout: 500ms
-#define SR_MAX_RETRANSMITS 20    // Max retransmit attempts per packet
+#define SR_WINDOW_SIZE 512       // Sliding window size (N=8)
+#define SR_PACKET_TIMEOUT_MS 700 // Individual packet timeout: 500ms
+#define SR_MAX_RETRANSMITS 200   // Max retransmit attempts per packet
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
@@ -90,7 +90,7 @@ public:
     bool prepare_retransmit(uint16_t seq_num, Packet &pkt_out);
 
     // === Statistics & Debugging ===
-    uint8_t get_window_size() const { return SR_WINDOW_SIZE; }
+    uint16_t get_window_size() const { return SR_WINDOW_SIZE; }
     uint8_t get_acked_count() const { return ack_bitmap.count(); }
     bool is_window_empty() const { return window_buffer.empty(); }
     bool is_packet_acked(uint16_t seq_num) const;
