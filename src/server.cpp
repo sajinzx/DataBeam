@@ -103,7 +103,11 @@ struct DecodedPacket
 void *worker_thread(void *arg)
 {
     // All file state lives here — only this thread touches the file
-    map<uint16_t, DecodedPacket> receive_buffer;
+    DecodedPacket *memory_pool = new DecodedPacket[1024];
+
+    // Track which slots are currently "occupied" with data
+    bool slot_occupied[1024];
+    memset(slot_occupied, false, sizeof(slot_occupied));
     ofstream outfile;
     string out_filepath = "";
     string current_filename = "";
@@ -147,7 +151,8 @@ void *worker_thread(void *arg)
                 continue;
             }
             expected_seq_num = 1;
-            receive_buffer.clear();
+            // Instead of receive_buffer.clear();
+            memset(slot_occupied, false, sizeof(slot_occupied));
             connection_init = true;
         }
 
@@ -185,28 +190,45 @@ void *worker_thread(void *arg)
             }
 
             expected_seq_num++;
-            save_checkpoint(current_filename, expected_seq_num);
+            if (expected_seq_num % 1000 == 0)
+            {
+                save_checkpoint(current_filename, expected_seq_num);
+            }
+            // save_checkpoint(current_filename, expected_seq_num);
 
             // Drain buffer
-            while (receive_buffer.count(expected_seq_num))
+            while (slot_occupied[expected_seq_num % 1024])
             {
-                DecodedPacket &bp = receive_buffer[expected_seq_num];
+                int idx = expected_seq_num % 1024;
+                DecodedPacket &bp = memory_pool[idx];
+
+                // 1. Calculate length and write
                 size_t bp_remaining = (size_t)bp.file_size - bp.chunk_offset;
                 size_t bp_write_len = min(bp.data_len, bp_remaining);
 
                 outfile.write(bp.data, (streamsize)bp_write_len);
+
                 if (outfile.fail())
                 {
-                    cerr << "[WORKER] Write failed buffered seq="
-                         << expected_seq_num << endl;
+                    save_checkpoint(current_filename, expected_seq_num);
+                    cerr << "[WORKER] Write failed buffered seq=" << expected_seq_num << endl;
                     outfile.clear();
                     break;
                 }
 
+                // 2. Performance: Batch Checkpointing (Crucial for 1GB!)
+                // Only write to disk (resume.json) every 1000 chunks to save I/O time
+                if (expected_seq_num % 1000 == 0)
+                {
+                    save_checkpoint(current_filename, expected_seq_num);
+                }
+
+                // 3. Mark the end condition
                 bool is_end = (bp.type == 3);
-                receive_buffer.erase(expected_seq_num);
+
+                // 4. Free the slot for the next "lap" of the circular buffer
+                slot_occupied[idx] = false;
                 expected_seq_num++;
-                save_checkpoint(current_filename, expected_seq_num);
 
                 if (is_end)
                 {
@@ -232,8 +254,15 @@ void *worker_thread(void *arg)
         }
         else if (pkt.seq_num > expected_seq_num)
         {
-            if (!receive_buffer.count(pkt.seq_num))
-                receive_buffer[pkt.seq_num] = decoded;
+            int idx = pkt.seq_num % 1024;
+
+            // Safety: Only store if we aren't already holding this packet
+            if (!slot_occupied[idx])
+            {
+                // Direct copy into the pre-allocated slot
+                memory_pool[idx] = decoded;
+                slot_occupied[idx] = true;
+            }
         }
     }
 
@@ -309,32 +338,6 @@ int main()
             continue; // timeout or error — loop again
 
         deserialize_packet(&pkt);
-
-        // ---- New file / connection init ------------------------------------
-        if (!connection_initialized || string(pkt.filename) != current_filename)
-        {
-            if (outfile.is_open())
-            {
-                outfile.flush();
-                outfile.close();
-            }
-
-            current_filename = pkt.filename;
-            out_filepath = "received/recv_" + current_filename; // FIX: assign outer
-
-            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
-            if (!outfile.is_open())
-            {
-                cerr << "[SERVER] Cannot create: " << out_filepath << endl;
-                return 1;
-            }
-            cout << "[SERVER] Opened: " << out_filepath << endl;
-
-            uint16_t resume_seq = load_checkpoint(current_filename);
-            expected_seq_num = (resume_seq > 1) ? resume_seq : 1;
-            memset(fast_buffer, 0, sizeof(fast_buffer)); // Clear buffer on new file
-            connection_initialized = true;
-        }
 
         // ---- Validate data_len --------------------------------------------
         size_t compressed_len = pkt.data_len;

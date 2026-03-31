@@ -2,7 +2,7 @@
 # LinkFlow Industry Benchmark Tool
 
 FILE_SIZE="1GB"
-TEST_FILE="static_files/1GB_file.bin"
+TEST_FILE="static_files/dummy1gb.bin"
 SERVER_IP="127.0.0.1"
 
 echo "--- Starting Industry Standard Benchmarking ---"

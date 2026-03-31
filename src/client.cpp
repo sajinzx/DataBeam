@@ -205,7 +205,7 @@ void *receiver_thread(void *arg)
 
                 // cout << " ACK for seq=" << ack_pkt.ack_num
                 //     << " | in-flight=" <<   endl;
-                if (arq.get_in_flight_count() > 240)
+                if (arq.get_in_flight_count() > 1000)
                 {
                     total_inflights++;
                 }
@@ -353,7 +353,7 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 200 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    tv.tv_usec = 300 * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
     int buffer_size = 32 * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
