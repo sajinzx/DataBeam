@@ -15,6 +15,7 @@
 #include "./headers/packet.h"
 #include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
 #include "./headers/compress.h"
+#include "./headers/crchw.h"
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -72,7 +73,7 @@ void *sender_thread(void *arg)
 
         if (!can_send)
         {
-            Sleep(1);
+            // Sleep(1);
             continue;
         }
 
@@ -102,18 +103,23 @@ void *sender_thread(void *arg)
         }
 
         // Attempt compression
-        char compressed_data[DATA_SIZE];
-        size_t compressed_len = DATA_SIZE;
+        char compressed_data[DATA_SIZE + 1];
+        size_t compressed_len = sizeof(compressed_data);
         bool is_compressed = false;
 
-        if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0 && compressed_len < bytes_read)
+        if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
         {
-            is_compressed = true;
+            // New compress_data handles the raw fallback internally via marker byte.
+            // Check the marker to know which path was taken.
+            is_compressed = ((uint8_t)compressed_data[0] == 0x01);
         }
         else
         {
-            memcpy(compressed_data, chunk_data, bytes_read);
-            compressed_len = bytes_read;
+            // compress_data itself failed (Z_BUF_ERROR etc.) — send raw
+            memcpy(compressed_data + 1, chunk_data, bytes_read);
+            compressed_data[0] = 0x00; // raw marker
+            compressed_len = bytes_read + 1;
+            is_compressed = false;
         }
 
         // Build packet
@@ -145,16 +151,19 @@ void *sender_thread(void *arg)
         {
             pthread_mutex_lock(&arq_mutex);
             arq.record_sent_packet(pkt); // records pkt and sets send timestamp
-            arq.increment_seq_num();          // [CHANGED] advance manually (no increment_seq_num in SR)
+            arq.increment_seq_num();     // [CHANGED] advance manually (no increment_seq_num in SR)
             chunk_offset += bytes_read;
             chunks_sent++;
             total_bytes_sent += bytes_read;
+            if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
+            {
 
-            cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
-                 << "] Seq=" << pkt.seq_num
-                 << " offset=" << current_offset
-                 << " bytes=" << bytes_read
-                 << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
+                cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
+                     << "] Seq=" << pkt.seq_num
+                     << " offset=" << current_offset
+                     << " bytes=" << bytes_read
+                     << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
+            }
             pthread_mutex_unlock(&arq_mutex);
         }
         else
@@ -293,7 +302,9 @@ void *logger_thread(void *arg)
 int main(int argc, char *argv[])
 {
     cout << " LinkFlow Phase 4 Client Starting (Selective Repeat ARQ)..." << endl;
-
+    cout << "CRC32 hardware acceleration: "
+         << (has_hw_crc32() ? "ENABLED (SSE4.2)" : "fallback (slicing-by-8)")
+         << endl;
     if (argc < 2)
     {
         cerr << "Usage: " << argv[0] << " <filename>" << endl;

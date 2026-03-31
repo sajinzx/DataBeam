@@ -112,7 +112,7 @@ vector<uint32_t> compute_file_hashes(const string &filepath)
 // ----------------------------------------------------------------------------
 int main()
 {
-    cout << " LinkFlow Phase 3 Server Starting (Advanced Features)..." << endl;
+    cout << " LinkFlow Phase 4 Server Starting (Advanced Features)..." << endl;
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -227,83 +227,155 @@ int main()
                 {
                     string out_filepath = "received/recv_" + current_filename;
 
-                    char decompressed_data[DATA_SIZE];
-                    size_t decompressed_len = DATA_SIZE;
-                    int decomp_res = decompress_data(pkt.data, actual_compressed_len, decompressed_data, decompressed_len);
+                    // ---- Decompress (handles both raw and deflated via marker byte) ------------
+                    char decompressed[DATA_SIZE];
+                    size_t decompressed_len = sizeof(decompressed);
 
-                    if (decomp_res != 0)
-                    {
-                        memcpy(decompressed_data, pkt.data, actual_compressed_len);
-                        decompressed_len = actual_compressed_len;
-                    }
+                    // actual_compressed_len must include the 1-byte marker prefix
+                    int decomp_result = decompress_data(
+                        pkt.data,
+                        actual_compressed_len,
+                        decompressed,
+                        decompressed_len);
 
-                    size_t bytes_to_write = decompressed_len;
-                    if (pkt.type == 3)
+                    if (decomp_result != 0)
                     {
-                        size_t remaining = pkt.file_size - pkt.chunk_offset;
-                        if (remaining < decompressed_len)
-                            bytes_to_write = remaining;
-                    }
-
-                    ofstream outfile;
-                    if (pkt.seq_num == 1 && expected_seq_num == 1)
-                    {
-                        outfile.open(out_filepath, ios::binary | ios::trunc);
-                    }
-                    else
-                    {
-                        outfile.open(out_filepath, ios::binary | ios::app);
+                        cerr << "[SERVER] Decompression failed seq=" << pkt.seq_num
+                             << " err=" << decomp_result << endl;
+                        continue; // SR ARQ will retransmit
                     }
 
-                    if (outfile.is_open())
+                    // ---- Write to file ---------------------------------------------------------
                     {
-                        outfile.write(decompressed_data, bytes_to_write);
-                        outfile.close();
-                    }
+                        // First packet ever → truncate (create fresh file)
+                        // All subsequent    → append
+                        ios::openmode mode = ios::binary |
+                                             (pkt.seq_num == 1 && expected_seq_num == 1
+                                                  ? ios::trunc
+                                                  : ios::app);
+
+                        ofstream outfile(out_filepath, mode);
+
+                        if (!outfile.is_open())
+                        {
+                            cerr << "[SERVER] Cannot open output file: " << out_filepath << endl;
+                            continue;
+                        }
+
+                        // BUG FIX: write from decompressed buffer, not decomp_result (int)
+                        // decompressed_len is set by decompress_data to the actual output size
+                        outfile.write(decompressed, (streamsize)decompressed_len);
+
+                        if (outfile.fail())
+                        {
+                            cerr << "[SERVER] File write failed at seq=" << pkt.seq_num << endl;
+                        }
+                    } // ofstream destructor closes the file here — no manual close() needed
 
                     expected_seq_num++;
 
                     // Save Checkpoint after successful write
                     save_checkpoint(current_filename, expected_seq_num);
 
-                    // Process Buffered Out-Of-Order Packets
+                    // ---- Process buffered out-of-order packets (SR reordering) ----------------
                     while (receive_buffer.find(expected_seq_num) != receive_buffer.end())
                     {
-                        Packet buffered_pkt = receive_buffer[expected_seq_num];
+                        Packet &buffered_pkt = receive_buffer[expected_seq_num];
 
-                        size_t buf_comp_len = DATA_SIZE;
-                        for (size_t len = 0; len <= DATA_SIZE; len++)
+                        // ----------------------------------------------------------------
+                        // BUG FIX 1: Remove the CRC brute-force loop entirely.
+                        // compressed length = total packet data - 1 marker byte.
+                        // The actual payload length is derived from file geometry:
+                        //   last chunk  → file_size - chunk_offset  (may be < DATA_SIZE)
+                        //   other chunks → DATA_SIZE
+                        // compress_data stores the marker byte at offset 0, so we pass
+                        // the full data field; decompress_data reads the marker itself.
+                        // ----------------------------------------------------------------
+                        size_t expected_raw_len;
+                        if (buffered_pkt.chunk_offset + DATA_SIZE >= (size_t)buffered_pkt.file_size)
+                            expected_raw_len = buffered_pkt.file_size - buffered_pkt.chunk_offset;
+                        else
+                            expected_raw_len = DATA_SIZE;
+
+                        // Compressed length = raw + 1 (marker byte), capped at DATA_SIZE
+                        size_t buf_comp_len = min(expected_raw_len + 1, (size_t)DATA_SIZE);
+
+                        // ----------------------------------------------------------------
+                        // CRC verification — verify BEFORE decompressing
+                        // ----------------------------------------------------------------
+                        uint32_t actual_crc = calculate_crc32(
+                            reinterpret_cast<const unsigned char *>(buffered_pkt.data),
+                            buf_comp_len);
+
+                        if (actual_crc != buffered_pkt.crc32)
                         {
-                            if (calculate_crc32(reinterpret_cast<unsigned char *>(buffered_pkt.data), len) == buffered_pkt.crc32)
+                            cerr << "[SERVER] CRC mismatch on buffered seq="
+                                 << expected_seq_num
+                                 << " expected=" << buffered_pkt.crc32
+                                 << " got=" << actual_crc << endl;
+
+                            // Erase corrupted packet — SR will retransmit it
+                            receive_buffer.erase(expected_seq_num);
+                            break; // stop draining buffer; wait for clean retransmit
+                        }
+
+                        // ----------------------------------------------------------------
+                        // Decompress — marker byte tells decompress_data which path to take
+                        // BUG FIX 2: buffer sized DATA_SIZE + 1 for safety
+                        // ----------------------------------------------------------------
+                        char buf_decomp_data[DATA_SIZE + 1];
+                        size_t buf_decomp_len = sizeof(buf_decomp_data);
+
+                        int decomp_ret = decompress_data(
+                            buffered_pkt.data,
+                            buf_comp_len,
+                            buf_decomp_data,
+                            buf_decomp_len);
+
+                        // BUG FIX 3: no silent fallback — drop and let SR retransmit
+                        if (decomp_ret != 0)
+                        {
+                            cerr << "[SERVER] Decompression failed on buffered seq="
+                                 << expected_seq_num
+                                 << " err=" << decomp_ret << endl;
+
+                            receive_buffer.erase(expected_seq_num);
+                            break;
+                        }
+
+                        // ----------------------------------------------------------------
+                        // BUG FIX 4: always clamp write_len to remaining file bytes,
+                        // not just on type == 3
+                        // ----------------------------------------------------------------
+                        size_t remaining = buffered_pkt.file_size - buffered_pkt.chunk_offset;
+                        size_t write_len = min(buf_decomp_len, remaining);
+
+                        // ----------------------------------------------------------------
+                        // Write to file
+                        // ----------------------------------------------------------------
+                        {
+                            ofstream outfile(out_filepath, ios::binary | ios::app);
+
+                            if (!outfile.is_open())
                             {
-                                buf_comp_len = len;
+                                cerr << "[SERVER] Cannot open file for buffered write: "
+                                     << out_filepath << endl;
                                 break;
                             }
-                        }
 
-                        char buf_decomp_data[DATA_SIZE];
-                        size_t buf_decomp_len = DATA_SIZE;
-                        if (decompress_data(buffered_pkt.data, buf_comp_len, buf_decomp_data, buf_decomp_len) != 0)
-                        {
-                            memcpy(buf_decomp_data, buffered_pkt.data, buf_comp_len);
-                            buf_decomp_len = buf_comp_len;
-                        }
+                            outfile.write(buf_decomp_data, (streamsize)write_len);
 
-                        size_t write_len = buf_decomp_len;
-                        if (buffered_pkt.type == 3)
-                        {
-                            size_t remaining = buffered_pkt.file_size - buffered_pkt.chunk_offset;
-                            if (remaining < buf_decomp_len)
-                                write_len = remaining;
-                        }
+                            if (outfile.fail())
+                            {
+                                cerr << "[SERVER] Write failed for buffered seq="
+                                     << expected_seq_num << endl;
+                                break;
+                            }
+                        } // auto-close on scope exit
 
-                        outfile.open(out_filepath, ios::binary | ios::app);
-                        if (outfile.is_open())
-                        {
-                            outfile.write(buf_decomp_data, write_len);
-                            outfile.close();
-                        }
-
+                        // ----------------------------------------------------------------
+                        // Advance state
+                        // ----------------------------------------------------------------
                         receive_buffer.erase(expected_seq_num);
                         expected_seq_num++;
 
@@ -312,8 +384,9 @@ int main()
                         if (buffered_pkt.type == 3)
                         {
                             is_receiving = false;
-                            cout << " File transfer completed successfully!" << endl;
-                            remove("resume.json"); // clear checkpoint on completion
+                            cout << "[SERVER] File transfer completed: " << out_filepath << endl;
+                            remove("resume.json");
+                            break; // END packet processed — stop draining
                         }
                     }
 
