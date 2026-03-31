@@ -1,6 +1,6 @@
-// LinkFlow Phase 3: UDP Client with Go-Back-N, Compression & Congestion Control
+// LinkFlow Phase 4: UDP Client with Selective Repeat ARQ
 // File: src/client.cpp
-// Purpose: High-throughput file transfer with sliding window and AIMD using Pthreads
+// Purpose: High-throughput file transfer with SR sliding window using Pthreads
 
 #include <iostream>
 #include <cstring>
@@ -13,14 +13,14 @@
 #include <zlib.h>
 #include <pthread.h>
 #include "./headers/packet.h"
-#include "./headers/arq.h"
+#include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
 
 using namespace std;
 
 // ----------------------------------------------------------------------------
 // Shared State (Protected by Mutex)
 // ----------------------------------------------------------------------------
-GoBackNARQ arq;
+SelectiveRepeatARQ arq; // [CHANGED] GoBackNARQ → SelectiveRepeatARQ
 pthread_mutex_t arq_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int sockfd;
@@ -67,45 +67,45 @@ void *sender_thread(void *arg)
     while (!transfer_complete)
     {
         pthread_mutex_lock(&arq_mutex);
-        bool can_send = (chunk_offset < file_size && arq.can_send_packet());
+        bool can_send = (chunk_offset < (uint32_t)file_size && arq.can_send_packet());
         pthread_mutex_unlock(&arq_mutex);
 
         if (!can_send)
         {
-            Sleep(1); // Sleep 1ms to prevent busy-waiting if window is full
+            Sleep(1);
             continue;
         }
 
-        // Lock again to verify and grab current stats
         pthread_mutex_lock(&arq_mutex);
-        if (!(chunk_offset < file_size && arq.can_send_packet()))
+        // Re-check under lock (TOCTOU guard)
+        if (!(chunk_offset < (uint32_t)file_size && arq.can_send_packet()))
         {
             pthread_mutex_unlock(&arq_mutex);
             continue;
         }
-        
+
         uint32_t current_offset = chunk_offset;
-        uint16_t seq = arq.get_next_seq_num();
-        uint8_t win_sz = arq.get_window_size();
-        uint16_t rtt = (uint16_t)arq.get_ewma_rtt();
+        // [CHANGED] SR tracks next_seq_num internally; read it directly
+        uint16_t seq = arq.next_seq_num;
         pthread_mutex_unlock(&arq_mutex);
 
-        // Read and prepare packet (outside of mutex lock to maximize concurrency)
+        // Read file chunk outside the lock
         char chunk_data[DATA_SIZE];
         memset(chunk_data, 0, DATA_SIZE);
         size_t bytes_read = 0;
 
         if (!read_file_chunk(filename_str, current_offset, chunk_data, bytes_read))
         {
-            cerr << "❌ Error reading file at offset " << current_offset << endl;
+            cerr << " Error reading file at offset " << current_offset << endl;
             transfer_complete = true;
             break;
         }
 
+        // Attempt compression
         char compressed_data[DATA_SIZE];
         size_t compressed_len = DATA_SIZE;
         bool is_compressed = false;
-        
+
         if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0 && compressed_len < bytes_read)
         {
             is_compressed = true;
@@ -114,28 +114,27 @@ void *sender_thread(void *arg)
         {
             memcpy(compressed_data, chunk_data, bytes_read);
             compressed_len = bytes_read;
-            is_compressed = false;
         }
 
+        // Build packet
         struct Packet pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.seq_num = seq;
         pkt.ack_num = 0;
-        
-        if (current_offset + bytes_read >= file_size)
-            pkt.type = 3; // END packet
-        else
-            pkt.type = is_compressed ? 5 : 0;
-
+        pkt.type = (current_offset + bytes_read >= (uint32_t)file_size)
+                       ? 3                        // END
+                       : (is_compressed ? 5 : 0); // DATA
         strcpy(pkt.filename, filename_str);
         pkt.file_size = file_size;
         pkt.chunk_offset = current_offset;
         pkt.crc32 = calculate_crc32((unsigned char *)compressed_data, compressed_len);
         memcpy(pkt.data, compressed_data, compressed_len);
         strcpy(pkt.username, "client_user");
-        pkt.window_size = win_sz;
-        pkt.rtt_sample = rtt;
+        // [CHANGED] SR has no congestion window / EWMA RTT; omit those fields
+        pkt.window_size = SR_WINDOW_SIZE;
+        pkt.rtt_sample = 0;
 
+        // Serialize a copy for sending
         struct Packet pkt_send = pkt;
         serialize_packet(&pkt_send);
 
@@ -145,21 +144,22 @@ void *sender_thread(void *arg)
         if (bytes_sent > 0)
         {
             pthread_mutex_lock(&arq_mutex);
-            arq.record_sent_packet(pkt);
-            arq.increment_seq_num();
+            arq.record_sent_packet(pkt); // records pkt and sets send timestamp
+            arq.next_seq_num++;          // [CHANGED] advance manually (no increment_seq_num in SR)
             chunk_offset += bytes_read;
             chunks_sent++;
             total_bytes_sent += bytes_read;
-            
-            std::string comp_status = is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]";
-            cout << "📨 [" << arq.get_in_flight_count() << "/" << (int)arq.get_window_size()
-                 << "] Seq=" << pkt.seq_num << " offset=" << current_offset
-                 << " bytes=" << bytes_read << comp_status << endl;
+
+            cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
+                 << "] Seq=" << pkt.seq_num
+                 << " offset=" << current_offset
+                 << " bytes=" << bytes_read
+                 << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
             pthread_mutex_unlock(&arq_mutex);
         }
         else
         {
-            cerr << "❌ sendto failed" << endl;
+            cerr << " sendto failed" << endl;
             transfer_complete = true;
             break;
         }
@@ -187,81 +187,102 @@ void *receiver_thread(void *arg)
             if (ack_pkt.type == 1) // ACK
             {
                 pthread_mutex_lock(&arq_mutex);
-                cout << "✅ ACK for seq=" << ack_pkt.ack_num
-                     << " (RTT sample: " << (int)arq.get_ewma_rtt() << "ms)" << endl;
-
+                // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
                 arq.handle_ack(ack_pkt.ack_num);
                 acks_received++;
-                
-                // Check if transfer is totally done
-                if (chunk_offset >= file_size && arq.get_in_flight_count() == 0)
+
+                cout << " ACK for seq=" << ack_pkt.ack_num
+                     << " | in-flight=" << arq.get_in_flight_count() << endl;
+
+                // Transfer done when all data sent and window fully drained
+                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
                 {
                     transfer_complete = true;
                 }
                 pthread_mutex_unlock(&arq_mutex);
             }
         }
-        else if (WSAGetLastError() != WSAETIMEDOUT && WSAGetLastError() != WSAEWOULDBLOCK)
-        {
-            // Ignore timeout, loop again
-        }
+        // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
     }
     return nullptr;
 }
 
 // ----------------------------------------------------------------------------
 // Thread 3: Timeout Thread
+// [CHANGED] SR checks timeouts per-packet and retransmits only the timed-out
+//           packet (not the whole window like GBN). API is also different:
+//           check_for_timeout() returns a seq_num (0 = none), then
+//           prepare_retransmit() resets the timer and gives back the packet.
 // ----------------------------------------------------------------------------
 void *timeout_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        Packet retransmit_pkt;
-        bool has_timeout = false;
+        uint16_t timed_out_seq = 0;
 
         pthread_mutex_lock(&arq_mutex);
-        if (arq.check_for_timeout(retransmit_pkt))
-        {
-            has_timeout = true;
-            arq.mark_loss();
-            cout << "⏱️  Timeout! Retransmitting seq=" << retransmit_pkt.seq_num << endl;
-        }
+        // [CHANGED] SR returns the seq_num of the first timed-out packet (0 = none)
+        timed_out_seq = arq.check_for_timeout();
         pthread_mutex_unlock(&arq_mutex);
 
-        if (has_timeout)
+        if (timed_out_seq != 0)
         {
-            struct Packet pkt_send = retransmit_pkt;
-            serialize_packet(&pkt_send);
-            sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
-                   (struct sockaddr *)&server_addr, addr_len);
+            Packet retransmit_pkt;
+            bool ready = false;
+
+            pthread_mutex_lock(&arq_mutex);
+            // [CHANGED] prepare_retransmit resets the timer, increments retry count,
+            //           and returns false if max retransmits exceeded
+            ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
+            pthread_mutex_unlock(&arq_mutex);
+
+            if (ready)
+            {
+                cout << "⏱️  Timeout! SR retransmitting only seq=" << timed_out_seq
+                     << " (not full window)" << endl;
+
+                struct Packet pkt_send = retransmit_pkt;
+                serialize_packet(&pkt_send);
+                sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
+                       (struct sockaddr *)&server_addr, addr_len);
+            }
+            else
+            {
+                // Max retransmits exceeded — abort transfer
+                cerr << " Max retransmits exceeded for seq=" << timed_out_seq
+                     << ". Aborting." << endl;
+                transfer_complete = true;
+            }
         }
 
-        Sleep(5); // Check timeouts every 5ms
+        Sleep(5); // Poll every 5ms
     }
     return nullptr;
 }
 
 // ----------------------------------------------------------------------------
 // Thread 4: Logger Thread
+// [CHANGED] Removed GBN-specific cwnd and EWMA RTT (not in SR).
+//           Logs window fill level and packet counts instead.
 // ----------------------------------------------------------------------------
 void *logger_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        Sleep(1000); // 1 second interval
-        if (transfer_complete) break; // Check again after sleep
+        Sleep(1000);
+        if (transfer_complete)
+            break;
 
         pthread_mutex_lock(&arq_mutex);
-        double cwnd = arq.get_congestion_window();
-        uint32_t rtt = arq.get_ewma_rtt();
         int in_flight = arq.get_in_flight_count();
         int acks = acks_received;
         int sent = chunks_sent;
+        // [CHANGED] Print SR window state snapshot instead of cwnd/RTT
+        arq.print_window_state();
         pthread_mutex_unlock(&arq_mutex);
 
-        cout << "📊 [LOGGER] cwnd: " << fixed << setprecision(1) << cwnd 
-             << " | RTT: " << rtt << "ms | InFlight: " << in_flight
-             << " | ACKs: " << acks << "/" << sent << endl;
+        cout << "[LOGGER] InFlight=" << in_flight << "/" << SR_WINDOW_SIZE
+             << " | ACKs=" << acks << "/" << sent << endl;
     }
     return nullptr;
 }
@@ -271,7 +292,7 @@ void *logger_thread(void *arg)
 // ----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    cout << "📡 LinkFlow Phase 3 Client Starting (Pthread Architecture)..." << endl;
+    cout << " LinkFlow Phase 4 Client Starting (Selective Repeat ARQ)..." << endl;
 
     if (argc < 2)
     {
@@ -279,10 +300,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Initialize Winsock
     WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        cerr << "❌ WSAStartup failed." << endl;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        cerr << " WSAStartup failed." << endl;
         return 1;
     }
 
@@ -291,21 +312,22 @@ int main(int argc, char *argv[])
 
     if (file_size < 0)
     {
-        cerr << "❌ Cannot open file: " << filename_str << endl;
+        cerr << " Cannot open file: " << filename_str << endl;
         return 1;
     }
 
     total_chunks = (file_size + DATA_SIZE - 1) / DATA_SIZE;
-    cout << "📁 File: " << filename_str << " (" << file_size << " bytes, " << total_chunks << " chunks)" << endl;
+    cout << " File: " << filename_str
+         << " (" << file_size << " bytes, " << total_chunks << " chunks)" << endl;
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
     {
-        cerr << "❌ Socket creation failed: " << strerror(errno) << endl;
+        cerr << "Socket creation failed: " << strerror(errno) << endl;
         return 1;
     }
-    
-    // Set socket timeout to 50ms for non-blocking ACK reception
+
+    // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 50 * 1000;
@@ -315,16 +337,17 @@ int main(int argc, char *argv[])
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    
+
     if (inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) <= 0)
     {
-        cerr << "❌ Invalid address" << endl;
-        close(sockfd);
+        cerr << " Invalid address" << endl;
+        closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
         return 1;
     }
 
-    cout << "🪟 Sliding Window Initialized. Mutex Ready." << endl;
-    cout << "\n📤 Starting Multithreaded Transmission...\n" << endl;
+    cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms" << endl;
+    cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
+         << endl;
 
     auto start_time = chrono::high_resolution_clock::now();
 
@@ -339,20 +362,20 @@ int main(int argc, char *argv[])
     pthread_join(t_timeout, nullptr);
     pthread_join(t_logger, nullptr);
 
-    close(sockfd);
+    closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
     WSACleanup();
 
     auto end_time = chrono::high_resolution_clock::now();
-    double elapsed_sec = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count() / 1000.0;
-    double throughput_mbps = (total_bytes_sent * 8.0) / (elapsed_sec * 1e6);
+    double elapsed = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count() / 1000.0;
+    double throughput = (total_bytes_sent * 8.0) / (elapsed * 1e6);
 
     cout << "\n✅ File transfer COMPLETE!" << endl;
-    cout << "📊 Performance Summary:" << endl;
+    cout << " Performance Summary:" << endl;
     cout << "   - Total chunks transmitted: " << chunks_sent << endl;
-    cout << "   - Total bytes sent: " << total_bytes_sent << endl;
-    cout << "   - ACKs received: " << acks_received << endl;
-    cout << "   - Elapsed time: " << fixed << setprecision(2) << elapsed_sec << "s" << endl;
-    cout << "   - Throughput: " << throughput_mbps << " Mbps" << endl;
+    cout << "   - Total bytes sent:         " << total_bytes_sent << endl;
+    cout << "   - ACKs received:            " << acks_received << endl;
+    cout << "   - Elapsed time:             " << fixed << setprecision(2) << elapsed << "s" << endl;
+    cout << "   - Throughput:               " << throughput << " Mbps" << endl;
 
     return 0;
 }
