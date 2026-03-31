@@ -3,14 +3,21 @@
 
 #include <iostream>
 #include <cstring>
-#include <unistd.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <fstream>
 #include <sstream>
 #include <map>
 #include <vector>
+
+// Windows system + sockets
+#include <winsock2.h>
+#include <windows.h>
+
+#include <ws2tcpip.h>
+
+// File/stat support (Windows-compatible)
 #include <sys/stat.h>
+
+// Your project headers
 #include "./headers/packet.h"
 #include "./headers/arq.h"
 
@@ -89,11 +96,11 @@ vector<uint32_t> compute_file_hashes(const string& filepath) {
 // Main Server
 // ----------------------------------------------------------------------------
 int main() {
-    cout << "📡 LinkFlow Phase 3 Server Starting (Advanced Features)..." << endl;
+    cout << " LinkFlow Phase 3 Server Starting (Advanced Features)..." << endl;
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        cerr << "❌ WSAStartup failed." << endl;
+        cerr << " WSAStartup failed." << endl;
         return 1;
     }
 
@@ -101,10 +108,10 @@ int main() {
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
-        cerr << "❌ Socket creation failed." << endl;
+        cerr << " Socket creation failed." << endl;
         return 1;
     }
-    cout << "✅ UDP socket created (fd=" << sockfd << ")" << endl;
+    cout << " UDP socket created (fd=" << sockfd << ")" << endl;
 
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -113,10 +120,10 @@ int main() {
     server_addr.sin_port = htons(PORT);
 
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        cerr << "❌ Bind failed." << endl;
+        cerr << " Bind failed." << endl;
         return 1;
     }
-    cout << "🎧 Listening on port " << PORT << "..." << endl;
+    cout << " Listening on port " << PORT << "..." << endl;
 
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
@@ -144,11 +151,11 @@ int main() {
                 
                 uint16_t resume_seq = load_checkpoint(current_filename);
                 if (resume_seq > 1) {
-                    cout << "\n🔄 Checkpoint loaded! Resuming transfer of " << current_filename << " from seq=" << resume_seq << endl;
+                    cout << "\n Checkpoint loaded! Resuming transfer of " << current_filename << " from seq=" << resume_seq << endl;
                     expected_seq_num = resume_seq;
                     
                     // 2. Feature: Rolling Hash Comparison 
-                    cout << "🔍 Computing rolling hashes for delta transfer comparison..." << endl;
+                    cout << " Computing rolling hashes for delta transfer comparison..." << endl;
                     vector<uint32_t> hashes = compute_file_hashes(filepath);
                     cout << "   -> Found " << hashes.size() << " existing chunk hashes in received/." << endl;
                 } else {
