@@ -5,12 +5,25 @@
 #include <cstring>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-
+#include "./crchw.h" // For CRC32 calculation
 #define PORT 12345
 #define DATA_SIZE 1440 // 1500 - 20 (IP) - 8 (UDP) - 32 (custom header)
 #define MAX_FILENAME 50
 #define USERNAME_MAX 32
 #pragma pack(push, 1)
+static inline uint64_t htonll_portable(uint64_t v)
+{
+    // Byte-swap each 32-bit half independently, keep them in their original halves.
+    // high word stays in high 32 bits; low word stays in low 32 bits — each reversed.
+    return (((uint64_t)htonl((uint32_t)(v >> 32))) << 32) |
+           ((uint64_t)htonl((uint32_t)(v & 0xFFFFFFFFULL)));
+}
+static inline uint64_t ntohll_portable(uint64_t v)
+{
+    return htonll_portable(v); // symmetric
+}
+#define htonll htonll_portable
+#define ntohll ntohll_portable
 struct ACKPacket
 {
     uint32_t ack_num; // The sequence number being acknowledged
@@ -40,6 +53,7 @@ struct SlimDataPacket
     char data[DATA_SIZE]; // The "Cargo"
 };
 #pragma pack(pop)
+
 #pragma pack(push, 1)
 struct StartPacket
 {
@@ -53,24 +67,30 @@ struct StartPacket
 #pragma pack(pop)
 // Serialize packet: convert host byte order to network byte order
 // Serialize Slim Data: Host -> Network
+inline uint32_t compute_ack_crc(const ACKPacket *pkt)
+{
+    // Hash all fields except crc32 (last 4 bytes)
+    return calculate_crc32(
+        reinterpret_cast<const unsigned char *>(pkt),
+        sizeof(ACKPacket) - sizeof(uint32_t));
+}
+
 inline void serialize_slim_packet(struct SlimDataPacket *pkt)
 {
-    pkt->seq_num = htonl(pkt->seq_num); // UPGRADED to 32-bit
+    pkt->seq_num = htonl(pkt->seq_num);
     pkt->crc32 = htonl(pkt->crc32);
     pkt->data_len = htons(pkt->data_len);
     pkt->chunk_offset = htonl(pkt->chunk_offset);
-    pkt->packet_iv = htonll(pkt->packet_iv); // 64-bit for Phase 7 IV
-    // Note: type, flags, and hmac (bytes) don't need conversion
+    pkt->packet_iv = htonll(pkt->packet_iv);
 }
 
-// Deserialize Slim Data: Network -> Host
 inline void deserialize_slim_packet(struct SlimDataPacket *pkt)
 {
-    pkt->seq_num = ntohl(pkt->seq_num); // UPGRADED to 32-bit
+    pkt->seq_num = ntohl(pkt->seq_num);
     pkt->crc32 = ntohl(pkt->crc32);
     pkt->data_len = ntohs(pkt->data_len);
     pkt->chunk_offset = ntohl(pkt->chunk_offset);
-    pkt->packet_iv = ntohll(pkt->packet_iv); // 64-bit for Phase 7 IV
+    pkt->packet_iv = ntohll(pkt->packet_iv);
 }
 
 inline void serialize_start_packet(struct StartPacket *pkt)
@@ -78,7 +98,6 @@ inline void serialize_start_packet(struct StartPacket *pkt)
     pkt->file_size = htonl(pkt->file_size);
     pkt->total_chunks = htonl(pkt->total_chunks);
     pkt->window_size = htons(pkt->window_size);
-    // Filename and Username are char arrays; they do NOT need conversion
 }
 
 inline void deserialize_start_packet(struct StartPacket *pkt)
@@ -87,11 +106,11 @@ inline void deserialize_start_packet(struct StartPacket *pkt)
     pkt->total_chunks = ntohl(pkt->total_chunks);
     pkt->window_size = ntohs(pkt->window_size);
 }
+
 inline void serialize_ack_packet(struct ACKPacket *pkt)
 {
-    pkt->ack_num = htonl(pkt->ack_num); // Match 32-bit seq_num
+    pkt->ack_num = htonl(pkt->ack_num);
     pkt->bitmap = htons(pkt->bitmap);
-
     pkt->crc32 = htonl(pkt->crc32);
 }
 
@@ -99,7 +118,6 @@ inline void deserialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = ntohl(pkt->ack_num);
     pkt->bitmap = ntohs(pkt->bitmap);
-
     pkt->crc32 = ntohl(pkt->crc32);
 }
 #endif

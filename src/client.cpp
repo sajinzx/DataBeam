@@ -75,7 +75,7 @@ void *sender_thread(void *arg)
 
         if (!can_send)
         {
-            // Sleep(1);
+            Sleep(1);
             continue;
         }
 
@@ -130,7 +130,7 @@ void *sender_thread(void *arg)
 
         slim_pkt.type = (current_offset + bytes_read >= (uint32_t)file_size) ? 3 : 0;
         slim_pkt.seq_num = seq; // Now 32-bit
-                                // slim_pkt.chunk_offset = current_offset;
+        slim_pkt.chunk_offset = current_offset; // [FIX Bug 6] was accidentally commented out
         slim_pkt.data_len = (uint16_t)compressed_len;
 
         // Use the flags byte to signal compression (Bit 0)
@@ -139,25 +139,33 @@ void *sender_thread(void *arg)
         // Zero out the Security Fields for now
         slim_pkt.packet_iv = 0;
         memset(slim_pkt.hmac, 0, 16);
-
-        // Copy the actual data
         memcpy(slim_pkt.data, compressed_data, compressed_len);
-
-        // Calculate CRC only on the payload data
-        slim_pkt.crc32 = calculate_crc32((unsigned char *)slim_pkt.data, slim_pkt.data_len);
-
-        // --- 3. SERIALIZE AND SEND ---
         struct SlimDataPacket pkt_send = slim_pkt;
-        serialize_slim_packet(&pkt_send);
 
+        // --- 3. COMPUTE CRC ---
+        // Zero the crc32 field first (sits in the MIDDLE of the struct).
+        // Hash the full struct, then store the result.
+        pkt_send.crc32 = 0;
+        uint32_t crc32_value = calculate_crc32(
+            reinterpret_cast<const unsigned char *>(&pkt_send),
+            sizeof(SlimDataPacket));
+        pkt_send.crc32 = crc32_value; // host order, CRC is now valid
+
+        // Save a pre-serialization snapshot for the ARQ retransmit buffer.
+        // CRITICAL: slim_pkt.crc32 is still 0 (never assigned above).
+        // If we recorded slim_pkt, every retransmit would send crc32=0 on the wire.
+        SlimDataPacket pkt_for_arq = pkt_send; // has crc32 set, fields in host order
+
+        // --- 4. SERIALIZE AND SEND ---
+        serialize_slim_packet(&pkt_send); // byte-swaps in place for the wire
         int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                                 (struct sockaddr *)&server_addr, addr_len);
-
         if (bytes_sent > 0)
         {
             pthread_mutex_lock(&arq_mutex);
-            // [IMPORTANT] arq.record_sent_packet must now accept SlimDataPacket
-            arq.record_sent_packet(slim_pkt);
+            // Record the host-order copy (with CRC set) so retransmits are correct.
+            arq.record_sent_packet(pkt_for_arq);
+            arq.increment_seq_num(); // advance next_seq_num after recording
 
             chunk_offset += bytes_read;
             chunks_sent++;
@@ -172,7 +180,6 @@ void *sender_thread(void *arg)
             //          << " bytes=" << bytes_read
             //          << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
             // }
-            pthread_mutex_unlock(&arq_mutex);
         }
         else
         {
@@ -199,14 +206,20 @@ void *receiver_thread(void *arg)
 
         if (bytes_recv > 0)
         {
-            // deserialize_packet(&ack_pkt);
-            uint32_t computed = calculate_crc32(reinterpret_cast<const unsigned char *>(&ack_pkt), sizeof(ACKPacket) - sizeof(uint32_t));
-            if (computed == ntohl(ack_pkt.crc32))
+            // [FIX Bug 3] Deserialize first so all fields are in host byte order,
+            // then use compute_ack_crc() which correctly excludes the crc32 tail field.
+            // The old code called ntohl(ack_pkt.crc32) BEFORE deserialize_ack_packet(),
+            // which also swaps crc32 — causing a double byte-swap.
+            deserialize_ack_packet(&ack_pkt);
+            uint32_t received_crc = ack_pkt.crc32; // now host order after deserialize
+            uint32_t computed = compute_ack_crc(&ack_pkt); // hashes host-order fields, excludes crc32
+            if (computed == received_crc)
             {
-
+                if (ack_pkt.ack_num == 0)
+                    continue;
                 pthread_mutex_lock(&arq_mutex);
                 // [CHANGED] SR uses individual ACKs per seq_num (not cumulative)
-                arq.handle_ack(ntohs(ack_pkt.ack_num));
+                arq.handle_ack(ack_pkt.ack_num);
                 acks_received++;
 
                 // cout << " ACK for seq=" << ack_pkt.ack_num
@@ -224,7 +237,7 @@ void *receiver_thread(void *arg)
             }
             else
             {
-                // cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ntohs(ack_pkt.ack_num) << endl;
+                cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack_pkt.ack_num << endl;
                 // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
             }
             // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
@@ -283,7 +296,7 @@ void *timeout_thread(void *arg)
 
         // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
         // a 1ms sleep makes the client respond to loss much faster.
-        Sleep(1);
+        Sleep(10);
     }
     return nullptr;
 }
@@ -396,7 +409,47 @@ int main(int argc, char *argv[])
     strncpy(start_pkt.filename, filename.c_str(), 256);
     serialize_start_packet(&start_pkt);
     sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0, (struct sockaddr *)&server_addr, addr_len);
-    
+    cout << "[CLIENT] Waiting for server handshake..." << endl;
+    bool handshake_done = false;
+    auto handshake_start = chrono::steady_clock::now();
+
+    while (!handshake_done)
+    {
+        ACKPacket ack;
+        int r = recvfrom(sockfd, (char *)&ack, sizeof(ack), 0,
+                         (struct sockaddr *)&server_addr, &addr_len);
+        if (r > 0)
+        {
+            // [FIX Bug 3] Same pattern as receiver_thread — deserialize first.
+            deserialize_ack_packet(&ack);
+            uint32_t received_crc = ack.crc32; // host order after deserialize
+            uint32_t computed = compute_ack_crc(&ack);
+
+            if (computed == received_crc && ack.ack_num == 0 && ack.type == 1)
+            {
+                cout << "[CLIENT] Handshake confirmed! Server ready." << endl;
+                cout << "[CLIENT] Starting data transfer in 200ms..." << endl;
+                Sleep(200); // brief pause — matches server's Sleep(200)
+                handshake_done = true;
+            }
+        }
+
+        // Timeout — retransmit StartPacket
+        auto elapsed = chrono::steady_clock::now() - handshake_start;
+        if (chrono::duration_cast<chrono::milliseconds>(elapsed).count() > 1000)
+        {
+            cout << "[CLIENT] No handshake response — retrying StartPacket..." << endl;
+            StartPacket start_pkt;
+            start_pkt.type = 2;
+            start_pkt.file_size = file_size;
+            start_pkt.total_chunks = total_chunks;
+            strncpy(start_pkt.filename, filename.c_str(), 256);
+            serialize_start_packet(&start_pkt);
+            sendto(sockfd, (const char *)&start_pkt, sizeof(start_pkt), 0,
+                   (struct sockaddr *)&server_addr, addr_len);
+            handshake_start = chrono::steady_clock::now();
+        }
+    }
     pthread_t t_sender, t_receiver, t_timeout, t_logger;
     pthread_create(&t_sender, nullptr, sender_thread, nullptr);
     pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
@@ -406,7 +459,7 @@ int main(int argc, char *argv[])
     pthread_join(t_sender, nullptr);
     pthread_join(t_receiver, nullptr);
     pthread_join(t_timeout, nullptr);
-    pthread_join(t_logger, nullptr);
+    // pthread_join(t_logger, nullptr);
 
     closesocket(sockfd); // [FIXED] close() → closesocket() on Windows/Winsock
     WSACleanup();
