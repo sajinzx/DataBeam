@@ -14,6 +14,7 @@
 // #include "./headers/arq.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
+#include "./headers/crypto.h"
 using namespace std;
 #define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window)
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
@@ -58,7 +59,7 @@ uint16_t load_checkpoint(const string &target_filename)
     buf << in.rdbuf();
     string content = buf.str();
     size_t f_pos = content.find("\"filename\"");
-    size_t s_pos = content.find("\"expected_seq\"");
+    size_t s_pos = content.find("\"last_seq\"");
     if (f_pos == string::npos || s_pos == string::npos)
         return 1;
     size_t f_start = content.find("\"", f_pos + 10) + 1;
@@ -72,7 +73,7 @@ uint16_t load_checkpoint(const string &target_filename)
     size_t s_end = content.find_first_of(",}", s_start);
     while (s_end > s_start && isspace(content[s_end - 1]))
         s_end--;
-    return (uint16_t)stoi(content.substr(s_start, s_end - s_start));
+    return (uint16_t)stoi(content.substr(s_start, s_end - s_start)) + 1;
 }
 
 vector<uint32_t> compute_file_hashes(const string &filepath)

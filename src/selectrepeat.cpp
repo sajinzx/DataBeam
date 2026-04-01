@@ -148,7 +148,7 @@ uint32_t SelectiveRepeatARQ::check_for_timeout()
 
     for (auto &entry : window_buffer)
     {
-        uint32_t seq_num = entry.first;  // [FIX Bug 4] was uint16_t
+        uint32_t seq_num = entry.first; // [FIX Bug 4] was uint16_t
         WindowPacket &wp = entry.second;
 
         // Skip already-acked packets

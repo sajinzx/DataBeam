@@ -21,7 +21,7 @@
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
 {
-    SlimDataPacket pkt;           // The actual packet data
+    SlimDataPacket pkt;   // The actual packet data
     timespec send_time;   // Send timestamp (CLOCK_MONOTONIC)
     bool is_acked;        // Has this packet been acknowledged?
     int retransmit_count; // Number of retransmission attempts

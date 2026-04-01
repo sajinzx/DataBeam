@@ -16,6 +16,7 @@
 #include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
+#include "./headers/crypto.h"
 #include <filesystem> // C++17
 using namespace std;
 
@@ -129,7 +130,7 @@ void *sender_thread(void *arg)
         memset(&slim_pkt, 0, sizeof(slim_pkt));
 
         slim_pkt.type = (current_offset + bytes_read >= (uint32_t)file_size) ? 3 : 0;
-        slim_pkt.seq_num = seq; // Now 32-bit
+        slim_pkt.seq_num = seq;                 // Now 32-bit
         slim_pkt.chunk_offset = current_offset; // [FIX Bug 6] was accidentally commented out
         slim_pkt.data_len = (uint16_t)compressed_len;
 
@@ -211,7 +212,7 @@ void *receiver_thread(void *arg)
             // The old code called ntohl(ack_pkt.crc32) BEFORE deserialize_ack_packet(),
             // which also swaps crc32 — causing a double byte-swap.
             deserialize_ack_packet(&ack_pkt);
-            uint32_t received_crc = ack_pkt.crc32; // now host order after deserialize
+            uint32_t received_crc = ack_pkt.crc32;         // now host order after deserialize
             uint32_t computed = compute_ack_crc(&ack_pkt); // hashes host-order fields, excludes crc32
             if (computed == received_crc)
             {
@@ -397,6 +398,42 @@ int main(int argc, char *argv[])
     }
 
     cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms" << endl;
+
+    // Check for resume checkpoint
+    uint32_t starting_seq = 1;
+    uint32_t starting_offset = 0;
+    ifstream in("resume.json");
+    if (in.is_open())
+    {
+        stringstream buf;
+        buf << in.rdbuf();
+        string content = buf.str();
+        size_t f_pos = content.find("\"filename\"");
+        size_t s_pos = content.find("\"last_seq\"");
+        if (f_pos != string::npos && s_pos != string::npos)
+        {
+            size_t f_start = content.find("\"", f_pos + 10) + 1;
+            size_t f_end = content.find("\"", f_start);
+            string saved = content.substr(f_start, f_end - f_start);
+            if (saved == filename)
+            {
+                size_t s_start = content.find(":", s_pos) + 1;
+                while (isspace(content[s_start]))
+                    s_start++;
+                size_t s_end = content.find_first_of(",}", s_start);
+                while (s_end > s_start && isspace(content[s_end - 1]))
+                    s_end--;
+                int last_seq = stoi(content.substr(s_start, s_end - s_start));
+                starting_seq = last_seq + 1;
+                starting_offset = last_seq * DATA_SIZE;
+                cout << " Resuming transfer from checkpoint: seq=" << starting_seq << ", offset=" << starting_offset << endl;
+            }
+        }
+    }
+
+    chunk_offset = starting_offset;
+    arq.set_start_seq((uint16_t)starting_seq);
+
     cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
          << endl;
 
