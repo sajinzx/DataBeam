@@ -521,12 +521,12 @@ int main()
             if (send_sack)
             {
                 // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
-                uint16_t sack_bm = 0;
+                uint64_t sack_bm = 0;
                 for (int i = 0; i < 16; i++)
                 {
                     uint32_t c = ack_seq + (uint32_t)i;
                     if (recv_mark[c % BUFFER_SIZE] == c)
-                        sack_bm |= (uint16_t)(1u << i);
+                        sack_bm |= (uint64_t)(1u << i);
                 }
 
                 ACKPacket sack;

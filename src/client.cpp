@@ -135,148 +135,200 @@ bool read_file_chunk(const char *filename, uint32_t offset, char *buffer, size_t
 }
 
 // ----------------------------------------------------------------------------
-// Thread 1: Sender Thread
+// Thread 1: Sender Thread — Burst / Batch Mode
+//
+// Architecture:
+//   • One lock snapshot per burst (not per packet) to read ARQ state.
+//   • Packets are fully built (read → compress → encrypt → CRC → serialize → HMAC)
+//     outside any mutex, maximising CPU utilisation on the hot path.
+//   • WSASendTo loop flushes the whole burst before yielding to the OS.
+//   • One trailing lock acquisition commits all pkts_built to the ARQ buffer.
 // ----------------------------------------------------------------------------
+
+#define BURST_SIZE 32   // packets per burst cycle
+
 void *sender_thread(void *arg)
 {
+    // Persistent file handle — avoids reopening the file BURST_SIZE times per cycle.
+    ifstream infile(filename_str, ios::binary);
+    if (!infile.is_open())
+    {
+        cerr << " [SENDER] Cannot open file: " << filename_str << endl;
+        transfer_complete = true;
+        return nullptr;
+    }
+
+    // Per-burst packet arrays (stack-allocated, ~96 KB — well within the 1 MB stack limit)
+    // wire_pkts: serialized network-byte-order packets sent via WSASendTo
+    // arq_pkts:  host-byte-order packets with CRC stored in the ARQ retransmit buffer
+    SlimDataPacket wire_pkts[BURST_SIZE];
+    SlimDataPacket arq_pkts[BURST_SIZE];
+    WSABUF         wsabufs[BURST_SIZE];
+
     while (!transfer_complete)
     {
+        // ── 1. Snapshot ARQ state (one lock for the whole batch check) ──────
         pthread_mutex_lock(&arq_mutex);
-        bool can_send = (chunk_offset < (uint32_t)file_size && arq.can_send_packet());
+        int      in_flight    = arq.get_in_flight_count(); // acquires window_mutex internally
+        uint32_t start_offset = chunk_offset;
+        uint32_t base_seq     = arq.get_next_seq_num();
         pthread_mutex_unlock(&arq_mutex);
 
-        if (!can_send)
+        bool has_data   = (start_offset < (uint32_t)file_size);
+        int  free_slots = SR_WINDOW_SIZE - in_flight;
+
+        if (!has_data || free_slots <= 0)
         {
             Sleep(1);
             continue;
         }
 
-        pthread_mutex_lock(&arq_mutex);
-        // Re-check under lock (TOCTOU guard)
-        if (!(chunk_offset < (uint32_t)file_size && arq.can_send_packet()))
+        // Congestion-aware batch size: never overfill the window.
+        int batch_size = (free_slots < BURST_SIZE) ? free_slots : BURST_SIZE;
+
+        // ── 2. Build batch outside the lock ───────────────────────────────
+        int      pkts_built       = 0;
+        uint32_t cur_offset       = start_offset;
+        size_t   batch_bytes_read = 0;
+
+        for (int b = 0; b < batch_size && cur_offset < (uint32_t)file_size; b++)
         {
-            pthread_mutex_unlock(&arq_mutex);
+            // 2a. Read chunk using the persistent handle (no open/close overhead)
+            char chunk_data[DATA_SIZE];
+            infile.seekg(cur_offset);
+            infile.read(chunk_data, DATA_SIZE);
+            size_t bytes_read = (size_t)infile.gcount();
+            if (bytes_read == 0)
+                break;
+
+            // 2b. Compress
+            char   compressed_data[DATA_SIZE + 1];
+            size_t compressed_len  = sizeof(compressed_data);
+            bool   is_compressed   = false;
+
+            if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
+            {
+                is_compressed = ((uint8_t)compressed_data[0] == 0x01);
+            }
+            else
+            {
+                memcpy(compressed_data + 1, chunk_data, bytes_read);
+                compressed_data[0] = 0x00;  // raw marker
+                compressed_len     = bytes_read + 1;
+            }
+
+            // 2c. Build packet header (zero-copy: only update changing fields per burst)
+            SlimDataPacket &arq_pkt = arq_pkts[b];
+            memset(&arq_pkt, 0, sizeof(arq_pkt));
+
+            generate_iv(&arq_pkt.packet_iv);   // unique IV per packet — MUST NOT be zeroed
+
+            // 2d. Encrypt compressed payload
+            char encrypted_data[DATA_SIZE + 1];
+            if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
+                             SHARED_SECRET_KEY, &arq_pkt.packet_iv,
+                             (uint8_t *)encrypted_data))
+            {
+                cerr << " [SENDER] Encryption failed at seq=" << (base_seq + b) << endl;
+                transfer_complete = true;
+                goto sender_abort;
+            }
+
+            bool is_last = (cur_offset + bytes_read >= (uint32_t)file_size);
+
+            arq_pkt.type         = is_last ? 3 : 0;
+            arq_pkt.seq_num      = base_seq + (uint32_t)b;
+            arq_pkt.chunk_offset = cur_offset;
+            arq_pkt.data_len     = (uint16_t)compressed_len;
+            arq_pkt.flags        = is_compressed ? 0x01 : 0x00;
+            memset(arq_pkt.hmac, 0, 16);
+            memcpy(arq_pkt.data, encrypted_data, compressed_len);
+
+            // 2e. CRC (on host-byte-order struct with crc32=0 and hmac=0)
+            arq_pkt.crc32 = 0;
+            arq_pkt.crc32 = calculate_crc32(
+                reinterpret_cast<const unsigned char *>(&arq_pkt),
+                sizeof(SlimDataPacket));
+
+            // 2f. Wire copy: serialize (byte-swap) then compute HMAC
+            SlimDataPacket &wire = wire_pkts[b];
+            wire = arq_pkt;                       // copy host-order packet (with CRC)
+            serialize_slim_packet(&wire);          // byte-swap in place for the wire
+            // hmac[] is 16 bytes — memset MUST be exactly 16 (not 32) to avoid
+            // overflowing into data[] and invalidating the CRC just computed.
+            memset(wire.hmac, 0, 16);
+            generate_hmac((const uint8_t *)&wire, sizeof(wire),
+                          SHARED_SECRET_KEY, wire.hmac);
+            memcpy(arq_pkt.hmac, wire.hmac, 16);  // keep ARQ copy consistent
+
+            // 2g. Set up WSABUF — points directly into wire_pkts[] (zero copy)
+            wsabufs[b].buf = reinterpret_cast<CHAR *>(&wire);
+            wsabufs[b].len = sizeof(wire);
+
+            cur_offset       += bytes_read;
+            batch_bytes_read += bytes_read;
+            pkts_built++;
+
+            if (is_last) break;
+        }
+
+        if (pkts_built == 0)
+        {
+            Sleep(1);
             continue;
         }
 
-        uint32_t current_offset = chunk_offset;
-        // [CHANGED] SR tracks next_seq_num internally; read it directly
-        uint32_t seq = arq.get_next_seq_num();
+        // ── 3. WSASendTo burst — tight loop, minimal context switches ─────
+        int pkts_sent = 0;
+        for (int b = 0; b < pkts_built; b++)
+        {
+            DWORD bytes_sent_dword = 0;
+            int result = WSASendTo(
+                (SOCKET)sockfd, &wsabufs[b], 1, &bytes_sent_dword, 0,
+                reinterpret_cast<SOCKADDR *>(&server_addr), (int)addr_len,
+                NULL, NULL);
+
+            if (result == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAEWOULDBLOCK)
+                {
+                    // Socket buffer full — back off and retry remaining later
+                    Sleep(1);
+                    break;
+                }
+                cerr << " [SENDER] WSASendTo failed: " << err << endl;
+                transfer_complete = true;
+                goto sender_abort;
+            }
+            pkts_sent++;
+        }
+
+        if (pkts_sent == 0)
+        {
+            Sleep(1);
+            continue;
+        }
+
+        // ── 4. Batch-commit ARQ state (single lock for whole burst) ───────
+        pthread_mutex_lock(&arq_mutex);
+        for (int b = 0; b < pkts_sent; b++)
+        {
+            arq.record_sent_packet(arq_pkts[b]); // host-order copy, correct CRC
+            arq.increment_seq_num();              // advance next_seq_num by 1
+        }
+        chunk_offset     += batch_bytes_read;
+        chunks_sent      += pkts_sent;
+        total_bytes_sent += batch_bytes_read;
         pthread_mutex_unlock(&arq_mutex);
-
-        // Read file chunk outside the lock
-        char chunk_data[DATA_SIZE];
-        memset(chunk_data, 0, DATA_SIZE);
-        size_t bytes_read = 0;
-
-        if (!read_file_chunk(filename_str, current_offset, chunk_data, bytes_read))
-        {
-            cerr << " Error reading file at offset " << current_offset << endl;
-            transfer_complete = true;
-            break;
-        }
-
-        // Attempt compression
-        char compressed_data[DATA_SIZE + 1];
-        size_t compressed_len = sizeof(compressed_data);
-        bool is_compressed = false;
-
-        if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
-        {
-            // New compress_data handles the raw fallback internally via marker byte.
-            // Check the marker to know which path was taken.
-            is_compressed = ((uint8_t)compressed_data[0] == 0x01);
-        }
-        else
-        {
-            // compress_data itself failed (Z_BUF_ERROR etc.) — send raw
-            memcpy(compressed_data + 1, chunk_data, bytes_read);
-            compressed_data[0] = 0x00; // raw marker
-            compressed_len = bytes_read + 1;
-            is_compressed = false;
-        }
-
-        // --- 2. BUILD THE SLIM DATA PACKET ---
-        struct SlimDataPacket slim_pkt;
-        memset(&slim_pkt, 0, sizeof(slim_pkt));
-        generate_iv(&(slim_pkt.packet_iv));
-
-        char encrypted_data[DATA_SIZE + 1];
-        if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len, SHARED_SECRET_KEY, &slim_pkt.packet_iv, (uint8_t *)encrypted_data))
-        {
-            cerr << " Encryption failed!" << endl;
-            transfer_complete = true;
-            break;
-        }
-        slim_pkt.type = (current_offset + bytes_read >= (uint32_t)file_size) ? 3 : 0;
-        slim_pkt.seq_num = seq;                 // Now 32-bit
-        slim_pkt.chunk_offset = current_offset; // [FIX Bug 6] was accidentally commented out
-        slim_pkt.data_len = (uint16_t)compressed_len;
-
-        // Use the flags byte to signal compression (Bit 0)
-        slim_pkt.flags = is_compressed ? 0x01 : 0x00;
-
-        // packet_iv was set by generate_iv() above — do NOT zero it here.
-        // The server needs the IV to decrypt; zeroing it makes decryption produce garbage.
-        memset(slim_pkt.hmac, 0, 16);
-        memcpy(slim_pkt.data, encrypted_data, compressed_len);
-        struct SlimDataPacket pkt_send = slim_pkt;
-
-        // --- 3. COMPUTE CRC ---
-        // Zero the crc32 field first (sits in the MIDDLE of the struct).
-        // Hash the full struct, then store the result.
-        pkt_send.crc32 = 0;
-        uint32_t crc32_value = calculate_crc32(
-            reinterpret_cast<const unsigned char *>(&pkt_send),
-            sizeof(SlimDataPacket));
-        pkt_send.crc32 = crc32_value; // host order, CRC is now valid
-
-        // Save a pre-serialization snapshot for the ARQ retransmit buffer.
-        // CRITICAL: slim_pkt.crc32 is still 0 (never assigned above).
-        // If we recorded slim_pkt, every retransmit would send crc32=0 on the wire.
-        SlimDataPacket pkt_for_arq = pkt_send; // has crc32 set, fields in host order
-
-        // --- 4. SERIALIZE AND SEND ---
-        serialize_slim_packet(&pkt_send); // byte-swaps in place for the wire
-        // HMAC is computed on the fully serialized (network-byte-order) packet.
-        // hmac[] is 16 bytes — memset/memcpy must use exactly 16, NOT 32.
-        // Using 32 would overflow into data[0..15], corrupting the payload
-        // and invalidating the CRC that was computed above.
-        memset(pkt_send.hmac, 0, 16);
-        generate_hmac((const uint8_t *)&pkt_send, sizeof(pkt_send), SHARED_SECRET_KEY, pkt_send.hmac);
-        memcpy(pkt_for_arq.hmac, pkt_send.hmac, 16);
-        int bytes_sent = sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
-                                (struct sockaddr *)&server_addr, addr_len);
-        if (bytes_sent > 0)
-        {
-            pthread_mutex_lock(&arq_mutex);
-            // Record the host-order copy (with CRC set) so retransmits are correct.
-            arq.record_sent_packet(pkt_for_arq);
-            arq.increment_seq_num(); // advance next_seq_num after recording
-
-            chunk_offset += bytes_read;
-            chunks_sent++;
-            total_bytes_sent += bytes_read;
-            pthread_mutex_unlock(&arq_mutex);
-            // if (seq % 1000 == 1) // Print every 1000 packets to avoid flooding the console
-            // {
-
-            //     cout << " [" << arq.get_in_flight_count() << "/" << SR_WINDOW_SIZE
-            //          << "] Seq=" << pkt.seq_num
-            //          << " offset=" << current_offset
-            //          << " bytes=" << bytes_read
-            //          << (is_compressed ? " [COMPRESSED]" : " [UNCOMPRESSED]") << endl;
-            // }
-        }
-        else
-        {
-            cerr << " sendto failed" << endl;
-            transfer_complete = true;
-            break;
-        }
     }
+
+sender_abort:
+    infile.close();
     return nullptr;
 }
+
+
 
 // ----------------------------------------------------------------------------
 // Thread 2: Receiver Thread
