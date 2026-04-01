@@ -16,10 +16,10 @@
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
 using namespace std;
-#define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window)
+#define BUFFER_SIZE 8192 // Enough for 512 packets in flight (assuming 8KB window) increase i window increase the buffer size to accomodate more packets in flight
 #define ACK_BATCH_SIZE 32
 #define RECV_TIMEOUT 1000
-#define SOC_BUFFER 64
+#define SOC_BUFFER 128
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
 struct WorkItem
 {
@@ -153,7 +153,7 @@ void *worker_thread(void *arg)
     // Use SlimDataPacket as the base for the pool.
     while (!start_received && !server_done)
     {
-        Sleep(1);
+        Sleep(3);
     }
     pthread_mutex_lock(&init_mutex);
     string current_filename = shared_filename;
@@ -192,6 +192,7 @@ void *worker_thread(void *arg)
             }
             item = work_queue.front();
             work_queue.pop();
+            g_perf.packets_processed++;
             pthread_mutex_unlock(&queue_mutex);
         }
 
@@ -238,7 +239,7 @@ void *worker_thread(void *arg)
             }
 
             expected_seq_num++;
-            g_perf.packets_processed++;
+
             if (expected_seq_num % 500 == 0)
                 save_checkpoint(current_filename, expected_seq_num);
             // 4. DRAIN THE POOL (Selective Repeat)
@@ -557,11 +558,13 @@ int main()
             }
             if (pkt.type == 3)
             {
-                // [FIX Bug 8] Don't set server_done here — it races with the worker
-                // draining the queue. The worker sets server_done itself after writing
+                // [FIX Bug 8] The worker sets server_done itself after writing
                 // the final chunk and closing the file (goto cleanup path).
-                // Just wake the worker so it processes the end-packet promptly.
+                // Breaking here races: server_done=true fires before the worker
+                // drains its queue. Just signal the worker — the if(server_done)
+                // check below will exit the main loop once the worker is done.
                 pthread_cond_signal(&queue_cond);
+                // DO NOT break here — wait for worker to finish via server_done
                 break;
             }
         }
@@ -577,7 +580,24 @@ int main()
     pthread_cond_signal(&queue_cond); // wake worker if it's waiting
     pthread_join(t_worker, nullptr);
     cout << "[SERVER] Transfer finished. Shutting down server..." << endl;
+    remove("resume.json");
     closesocket(sockfd);
     WSACleanup();
+    uint32_t count = g_perf.packets_processed.load();
+    if (count == 0)
+        return 0;
+
+    double avg_net = (double)g_perf.total_net_recv_time_us / count;
+    double avg_wait = (double)g_perf.total_worker_wait_us / count;
+    double avg_decomp = (double)g_perf.total_decomp_time_us / count;
+    double avg_disk = (double)g_perf.total_disk_write_us / count;
+
+    cout << "\n--- PERFORMANCE REPORT (Average per Packet) ---" << endl;
+    cout << "Network Recv:  " << avg_net << " us" << endl;
+    cout << "Worker Idle:   " << avg_wait << " us (If high, increase Window Size)" << endl;
+    cout << "Decompress:    " << avg_decomp << " us (If high, add more Worker Threads)" << endl;
+    cout << "Disk Write:    " << avg_disk << " us (If high, check SSD/HDD speed)" << endl;
+    cout << "Buffer Fulls:  " << g_perf.buffer_full_events << " (If >0, Increase BUFFER_SIZE)" << endl;
+    cout << "-----------------------------------------------" << endl;
     return 0;
 }

@@ -17,13 +17,17 @@
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include "./headers/ringbuf.h"
 #include <filesystem> // C++17
 #include <chrono>
 #include <atomic>
 #include <vector>
-#define BITMAP_ACK 16
+#define BITMAP_ACK 64
 #define SOC_BUFFER 64
-#define RECV_TIMEOUT 200
+#define RECV_TIMEOUT 30
+#define BITMAP_SIZE 64
+// Number of compressor threads — tune to CPU core count
+#define COMPRESSOR_THREADS 4 // increase to 8 on 8+ core machines
 using namespace std;
 
 // ----------------------------------------------------------------------------
@@ -51,18 +55,54 @@ volatile bool transfer_complete = false;
 // Helper Functions
 // ----------------------------------------------------------------------------
 
+// ---- Pipeline packet structs -----------------------------------------------
+
+struct RawChunk
+{
+    char data[DATA_SIZE];
+    size_t bytes_read;
+    uint32_t offset;
+    uint32_t seq_num;
+    bool is_last;
+};
+
+struct ReadyPacket
+{
+    SlimDataPacket pkt; // fully built, ready to sendto()
+    size_t wire_len;    // actual bytes to send (sizeof pkt always, but tracked)
+};
+
+// ---- Pipeline queues -------------------------------------------------------
+// Raw queue: dispatcher → compressor threads (SPMC: one dispatcher, N compressors)
+// Ready queue: compressor threads → sender thread (MPSC: N compressors, one sender)
+
+static const size_t RAW_Q_CAP = 4096;
+static const size_t READY_Q_CAP = 4096;
+
+// Raw queue uses mutex push (multiple compressors pop, one dispatcher pushes)
+RingBuf<RawChunk, RAW_Q_CAP> raw_queue;
+pthread_mutex_t raw_pop_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Ready queue uses mutex push (multiple compressors push, one sender pops)
+MPRingBuf<ReadyPacket, READY_Q_CAP> ready_queue;
+
+// Dispatcher state
+atomic<uint32_t> dispatch_offset{0};
+atomic<uint32_t> dispatch_seq{1};
+atomic<bool> dispatch_done{false};
+
 struct PerfStats
 {
     // Latency Metrics
-    std::atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
-    std::atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
-    std::atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
-    std::atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
+    atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
+    atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
+    atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
+    atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
 
     // Throughput & Buffer Metrics
-    std::atomic<uint32_t> packets_processed{0};
-    std::atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
-    std::atomic<uint32_t> crc_fails{0};
+    atomic<uint32_t> packets_processed{0};
+    atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
+    atomic<uint32_t> crc_fails{0};
 
     // Function to get current time in microseconds
     static long long now_us()
@@ -74,6 +114,7 @@ struct PerfStats
 };
 
 PerfStats g_perf; // Global performance object
+
 long get_file_size(const char *filename)
 {
     ifstream file(filename, ios::binary | ios::ate);
@@ -266,7 +307,7 @@ void *receiver_thread(void *arg)
                 pthread_mutex_lock(&arq_mutex);
 
                 uint32_t cum = ack_pkt.ack_num;    // cumulative watermark (server's next expected seq)
-                uint16_t sack_bm = ack_pkt.bitmap; // bit i = server has packet (cum + i)
+                uint64_t sack_bm = ack_pkt.bitmap; // bit i = server has packet (cum + i)
 
                 // 1. Slide the window: bulk-free all RAM for packets below the watermark
                 arq.handle_cumulative_ack(cum);
@@ -286,7 +327,7 @@ void *receiver_thread(void *arg)
                 // 3. Fast retransmit: scan bitmap for holes below the highest received bit
                 //    e.g. bitmap = 0b1101 → cum+0, cum+2 received; cum+1 is a hole → retransmit now
                 int highest_bit = -1;
-                for (int i = 15; i >= 0; i--)
+                for (int i = ((sizeof(sack_bm) * 8) - 1); i >= 0; i--)
                 {
                     if (sack_bm & (1u << i))
                     {
@@ -295,7 +336,7 @@ void *receiver_thread(void *arg)
                     }
                 }
 
-                uint32_t fast_retransmit_seqs[16];
+                uint32_t fast_retransmit_seqs[BITMAP_SIZE];
                 int fast_retransmit_count = 0;
                 for (int i = 0; i < highest_bit; i++)
                 {
@@ -385,7 +426,7 @@ void *timeout_thread(void *arg)
 
         // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
         // a 1ms sleep makes the client respond to loss much faster.
-        Sleep(10);
+        Sleep(1);
     }
     return nullptr;
 }
@@ -467,7 +508,7 @@ int main(int argc, char *argv[])
     // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = RECV_TIMEOUT * 1000;            // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    tv.tv_usec = RECV_TIMEOUT * 1000;           // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
     int buffer_size = SOC_BUFFER * 1024 * 1024; // 16 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
@@ -602,5 +643,4 @@ int main(int argc, char *argv[])
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
     cout << "   - Max in-flight packets:    " << total_inflights << endl;
     cout << "   - Total retransmissions:    " << retransmissions << endl;
-   
 }
