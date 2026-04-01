@@ -40,7 +40,7 @@ void create_received_dir()
         mkdir("received");
 }
 
-void save_checkpoint(const string &filename, uint16_t expected_seq)
+void save_checkpoint(const string &filename, uint32_t expected_seq)
 {
     ofstream out("resume.json");
     if (out.is_open())
@@ -50,7 +50,7 @@ void save_checkpoint(const string &filename, uint16_t expected_seq)
     }
 }
 
-uint16_t load_checkpoint(const string &target_filename)
+uint32_t load_checkpoint(const string &target_filename)
 {
     ifstream in("resume.json");
     if (!in.is_open())
@@ -59,7 +59,7 @@ uint16_t load_checkpoint(const string &target_filename)
     buf << in.rdbuf();
     string content = buf.str();
     size_t f_pos = content.find("\"filename\"");
-    size_t s_pos = content.find("\"last_seq\"");
+    size_t s_pos = content.find("\"expected_seq\"");
     if (f_pos == string::npos || s_pos == string::npos)
         return 1;
     size_t f_start = content.find("\"", f_pos + 10) + 1;
@@ -73,7 +73,7 @@ uint16_t load_checkpoint(const string &target_filename)
     size_t s_end = content.find_first_of(",}", s_start);
     while (s_end > s_start && isspace(content[s_end - 1]))
         s_end--;
-    return (uint16_t)stoi(content.substr(s_start, s_end - s_start)) + 1;
+    return (uint32_t)stoul(content.substr(s_start, s_end - s_start));
 }
 
 vector<uint32_t> compute_file_hashes(const string &filepath)
@@ -269,6 +269,7 @@ void *worker_thread(void *arg)
     }
 cleanup:
     delete[] pool;
+    cout << "[WORKER] Worker thread exiting." << endl;
     return nullptr;
 }
 
@@ -459,14 +460,21 @@ int main()
                 // the final chunk and closing the file (goto cleanup path).
                 // Just wake the worker so it processes the end-packet promptly.
                 pthread_cond_signal(&queue_cond);
+                break;
             }
+        }
+        if (server_done)
+        {
+            is_receiving = false;
+            break; // Exit the loop cleanly
         }
         // pkt.seq_num < expected_seq_num → duplicate, already processed, ignore
     }
+
     server_done = true;
     pthread_cond_signal(&queue_cond); // wake worker if it's waiting
     pthread_join(t_worker, nullptr);
-
+    cout << "[SERVER] Transfer finished. Shutting down server..." << endl;
     closesocket(sockfd);
     WSACleanup();
     return 0;

@@ -90,7 +90,7 @@ void *sender_thread(void *arg)
 
         uint32_t current_offset = chunk_offset;
         // [CHANGED] SR tracks next_seq_num internally; read it directly
-        uint16_t seq = arq.get_next_seq_num();
+        uint32_t seq = arq.get_next_seq_num();
         pthread_mutex_unlock(&arq_mutex);
 
         // Read file chunk outside the lock
@@ -409,7 +409,7 @@ int main(int argc, char *argv[])
         buf << in.rdbuf();
         string content = buf.str();
         size_t f_pos = content.find("\"filename\"");
-        size_t s_pos = content.find("\"last_seq\"");
+        size_t s_pos = content.find("\"expected_seq\"");
         if (f_pos != string::npos && s_pos != string::npos)
         {
             size_t f_start = content.find("\"", f_pos + 10) + 1;
@@ -423,16 +423,16 @@ int main(int argc, char *argv[])
                 size_t s_end = content.find_first_of(",}", s_start);
                 while (s_end > s_start && isspace(content[s_end - 1]))
                     s_end--;
-                int last_seq = stoi(content.substr(s_start, s_end - s_start));
-                starting_seq = last_seq + 1;
-                starting_offset = last_seq * DATA_SIZE;
+                uint32_t expected_seq = (uint32_t)stoul(content.substr(s_start, s_end - s_start));
+                starting_seq = expected_seq;
+                starting_offset = (expected_seq - 1) * DATA_SIZE;
                 cout << " Resuming transfer from checkpoint: seq=" << starting_seq << ", offset=" << starting_offset << endl;
             }
         }
     }
 
     chunk_offset = starting_offset;
-    arq.set_start_seq((uint16_t)starting_seq);
+    arq.set_start_seq(starting_seq);
 
     cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
          << endl;
