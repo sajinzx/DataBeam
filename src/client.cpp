@@ -1,6 +1,11 @@
-// LinkFlow Phase 4: UDP Client with Selective Repeat ARQ
+// LinkFlow Phase 5: UDP Client — 3-Stage Concurrent Pipeline
 // File: src/client.cpp
 // Purpose: High-throughput file transfer with SR sliding window using Pthreads
+//
+// Pipeline Architecture:
+//   Stage 1 (dispatcher) — reads file chunks, assigns seq_nums
+//   Stage 2 (compressors) — N threads compress + encrypt + CRC in parallel
+//   Stage 3 (sender) — reorders, serializes, HMAC, WSASendTo, ARQ record
 
 #include <iostream>
 #include <cstring>
@@ -13,27 +18,85 @@
 #include <zlib.h>
 #include <pthread.h>
 #include "./headers/packet.h"
-#include "./headers/selectrepeat.h" // [CHANGED] GBN → SR header
+#include "./headers/selectrepeat.h"
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
 #include "./headers/ringbuf.h"
 #include <filesystem> // C++17
-#include <chrono>
+
 #include <atomic>
 #include <vector>
-#define BITMAP_ACK 64
-#define SOC_BUFFER 64
-#define RECV_TIMEOUT 30
-#define BITMAP_SIZE 64
-// Number of compressor threads — tune to CPU core count
-#define COMPRESSOR_THREADS 4 // increase to 8 on 8+ core machines
+#include <map>
+#include <sys/stat.h>
+
+
+
+#define BITMAP_ACK 64   // Bitmap ACKs cover 64 packets beyond the cumulative ACK
+#define SOC_BUFFER 128  // Socket buffer size in MB (both send and receive)
+#define RECV_TIMEOUT 30 // 30-second recv timeout for ACKs
+#define BITMAP_SIZE 64  // Bitmap size ACKs cover 64 packets beyond the cumulative ACK
+// Number of compressor threads -- tune to CPU core count
+#define COMPRESSOR_THREADS 6 // increase to 8 on 8+ core machines
 using namespace std;
 
+
+struct ClientPerf {
+    // Stage Latencies (Microseconds)
+    std::atomic<long long> total_disk_read_us{0};
+    std::atomic<long long> total_compress_us{0};
+    std::atomic<long long> total_crypto_us{0};    // AES-GCM time
+    std::atomic<long long> total_send_syscall_us{0}; 
+    
+    // Waiting/Blocking Metrics
+    std::atomic<long long> total_window_wait_us{0}; // Time spent waiting for ACKs/Window Slide
+    
+    // Counters
+    std::atomic<uint32_t> packets_sent{0};
+    std::atomic<uint32_t> window_full_events{0};
+
+    static long long now_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    }
+
+    void reset() {
+        total_disk_read_us = total_compress_us = total_crypto_us = 0;
+        total_send_syscall_us = total_window_wait_us = 0;
+        packets_sent = window_full_events = 0;
+    }
+};
+
+ClientPerf g_cperf; // Global client performance object
+void print_client_report()
+{
+    uint32_t count = g_cperf.packets_sent.load();
+    if (count == 0)
+        return;
+
+    std::cout << "\n--- CLIENT PERFORMANCE REPORT (Average per Packet) ---" << std::endl;
+    std::cout << std::fixed << std::setprecision(2);
+
+    std::cout << "1. Window Wait:   " << (double)g_cperf.total_window_wait_us / count << " us"
+              << " (If high, increase Server ACK Batch size)" << std::endl;
+
+    std::cout << "2. Disk Read:     " << (double)g_cperf.total_disk_read_us / count << " us" << std::endl;
+
+    std::cout << "3. Compression:   " << (double)g_cperf.total_compress_us / count << " us"
+              << " (If high for video, DISABLE it)" << std::endl;
+
+    std::cout << "4. Crypto/AES:    " << (double)g_cperf.total_crypto_us / count << " us" << std::endl;
+
+    std::cout << "5. Network Send:  " << (double)g_cperf.total_send_syscall_us / count << " us"
+              << " (If high, use Batch/WSASendTo)" << std::endl;
+
+    std::cout << "Window Full Count: " << g_cperf.window_full_events << std::endl;
+    std::cout << "------------------------------------------------------" << std::endl;
+}
 // ----------------------------------------------------------------------------
 // Shared State (Protected by Mutex)
 // ----------------------------------------------------------------------------
-SelectiveRepeatARQ arq; // [CHANGED] GoBackNARQ → SelectiveRepeatARQ
+SelectiveRepeatARQ arq;
 pthread_mutex_t arq_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int sockfd;
@@ -41,7 +104,7 @@ struct sockaddr_in server_addr;
 socklen_t addr_len;
 string filename;
 const char *filename_str;
-long file_size;
+uint32_t file_size;
 uint32_t chunk_offset = 0;
 int total_chunks;
 int chunks_sent = 0;
@@ -68,18 +131,18 @@ struct RawChunk
 
 struct ReadyPacket
 {
-    SlimDataPacket pkt; // fully built, ready to sendto()
-    size_t wire_len;    // actual bytes to send (sizeof pkt always, but tracked)
+    SlimDataPacket pkt;  // fully built, CRC set, ready to serialize+send
+    size_t original_len; // uncompressed chunk size (for counter updates)
 };
 
 // ---- Pipeline queues -------------------------------------------------------
-// Raw queue: dispatcher → compressor threads (SPMC: one dispatcher, N compressors)
-// Ready queue: compressor threads → sender thread (MPSC: N compressors, one sender)
+// Raw queue: dispatcher -> compressor threads (SPMC: one dispatcher, N compressors)
+// Ready queue: compressor threads -> sender thread (MPSC: N compressors, one sender)
 
 static const size_t RAW_Q_CAP = 4096;
 static const size_t READY_Q_CAP = 4096;
 
-// Raw queue uses mutex push (multiple compressors pop, one dispatcher pushes)
+// Raw queue uses mutex pop (multiple compressors pop, one dispatcher pushes)
 RingBuf<RawChunk, RAW_Q_CAP> raw_queue;
 pthread_mutex_t raw_pop_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -90,21 +153,21 @@ MPRingBuf<ReadyPacket, READY_Q_CAP> ready_queue;
 atomic<uint32_t> dispatch_offset{0};
 atomic<uint32_t> dispatch_seq{1};
 atomic<bool> dispatch_done{false};
+atomic<int> compressors_done{0};
 
 struct PerfStats
 {
     // Latency Metrics
-    atomic<long long> total_net_recv_time_us{0}; // Time spent in recvfrom
-    atomic<long long> total_worker_wait_us{0};   // Time worker spent sleeping/waiting for queue
-    atomic<long long> total_decomp_time_us{0};   // Time spent decompressing
-    atomic<long long> total_disk_write_us{0};    // Time spent in seekp/write
+    atomic<long long> total_net_recv_time_us{0};
+    atomic<long long> total_worker_wait_us{0};
+    atomic<long long> total_decomp_time_us{0};
+    atomic<long long> total_disk_write_us{0};
 
     // Throughput & Buffer Metrics
     atomic<uint32_t> packets_processed{0};
-    atomic<uint32_t> buffer_full_events{0}; // How often queue reached MAX_SIZE
+    atomic<uint32_t> buffer_full_events{0};
     atomic<uint32_t> crc_fails{0};
 
-    // Function to get current time in microseconds
     static long long now_us()
     {
         return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -113,179 +176,248 @@ struct PerfStats
     }
 };
 
-PerfStats g_perf; // Global performance object
-
-long get_file_size(const char *filename)
+PerfStats g_perf;
+uint32_t get_file_size(const char *filename)
 {
-    ifstream file(filename, ios::binary | ios::ate);
-    if (!file.is_open())
-        return -1;
-    return file.tellg();
+    struct _stat64 st;
+
+    if (_stat64(filename, &st) != 0)
+        return 0;
+
+    if (st.st_size > 0xFFFFFFFF)
+    {
+        std::cerr << "[ERROR] File exceeds 4GB limit\n";
+        return 0;
+    }
+
+    return static_cast<uint32_t>(st.st_size);
 }
 
-bool read_file_chunk(const char *filename, uint32_t offset, char *buffer, size_t &bytes_read)
+// ============================================================================
+// STAGE 1: Dispatcher Thread (1 thread)
+// Reads file chunks sequentially, assigns monotonic seq_nums, pushes into
+// raw_queue. Applies back-pressure when ARQ window or raw_queue is saturated.
+// ============================================================================
+
+void *dispatcher_thread(void *arg)
 {
-    ifstream file(filename, ios::binary);
-    if (!file.is_open())
-        return false;
-    file.seekg(offset);
-    file.read(buffer, DATA_SIZE);
-    bytes_read = file.gcount();
-    return true;
-}
-
-// ----------------------------------------------------------------------------
-// Thread 1: Sender Thread — Burst / Batch Mode
-//
-// Architecture:
-//   • One lock snapshot per burst (not per packet) to read ARQ state.
-//   • Packets are fully built (read → compress → encrypt → CRC → serialize → HMAC)
-//     outside any mutex, maximising CPU utilisation on the hot path.
-//   • WSASendTo loop flushes the whole burst before yielding to the OS.
-//   • One trailing lock acquisition commits all pkts_built to the ARQ buffer.
-// ----------------------------------------------------------------------------
-
-#define BURST_SIZE 34 // packets per burst cycle
-
-void *sender_thread(void *arg)
-{
-    // Persistent file handle — avoids reopening the file BURST_SIZE times per cycle.
     ifstream infile(filename_str, ios::binary);
     if (!infile.is_open())
     {
-        cerr << " [SENDER] Cannot open file: " << filename_str << endl;
+        cerr << " [DISPATCHER] Cannot open file: " << filename_str << endl;
+        cerr << "Reason: " << strerror(errno) << endl;
+        dispatch_done.store(true, std::memory_order_release);
         transfer_complete = true;
         return nullptr;
     }
 
-    // Per-burst packet arrays (stack-allocated, ~96 KB — well within the 1 MB stack limit)
-    // wire_pkts: serialized network-byte-order packets sent via WSASendTo
-    // arq_pkts:  host-byte-order packets with CRC stored in the ARQ retransmit buffer
-    SlimDataPacket wire_pkts[BURST_SIZE];
-    SlimDataPacket arq_pkts[BURST_SIZE];
-    WSABUF wsabufs[BURST_SIZE];
+    uint32_t local_offset = chunk_offset; // honours resume checkpoint
+
+    while (local_offset < (uint32_t)file_size && !transfer_complete)
+    {
+        // Back-pressure: total pipeline + in-flight must stay under window
+        while (!transfer_complete)
+        {
+            pthread_mutex_lock(&arq_mutex);
+            int in_flight = arq.get_in_flight_count();
+            pthread_mutex_unlock(&arq_mutex);
+            if (in_flight + (int)raw_queue.size() + (int)ready_queue.size() < SR_WINDOW_SIZE)
+                break;
+            SwitchToThread();
+        }
+        if (transfer_complete)
+            break;
+
+        // Back-pressure: raw_queue 75% full
+        while (raw_queue.size() > (RAW_Q_CAP * 3) / 4 && !transfer_complete)
+            SwitchToThread();
+        if (transfer_complete)
+            break;
+
+        // Read one chunk
+        RawChunk rc;
+        infile.seekg(local_offset);
+        infile.read(rc.data, DATA_SIZE);
+        rc.bytes_read = (size_t)infile.gcount();
+        if (rc.bytes_read == 0)
+            break;
+
+        rc.offset = local_offset;
+        rc.seq_num = dispatch_seq.fetch_add(1, std::memory_order_relaxed);
+        rc.is_last = (local_offset + rc.bytes_read >= (uint32_t)file_size);
+
+        while (!raw_queue.push(rc))
+        {
+            if (transfer_complete)
+                break;
+            SwitchToThread();
+        }
+
+        local_offset += (uint32_t)rc.bytes_read;
+        if (rc.is_last)
+            break;
+    }
+
+    dispatch_done.store(true, std::memory_order_release);
+    infile.close();
+    return nullptr;
+}
+
+// ============================================================================
+// STAGE 2: Compressor Thread (N threads, default COMPRESSOR_THREADS = 4)
+// Pops raw chunks, compresses, encrypts, builds SlimDataPacket with CRC,
+// then pushes ReadyPacket into ready_queue for the sender.
+// ============================================================================
+
+void *compressor_thread(void *arg)
+{
+    while (!transfer_complete)
+    {
+        RawChunk rc;
+        bool got = false;
+
+        // Pop from raw_queue (mutex for SPMC safety)
+        pthread_mutex_lock(&raw_pop_mutex);
+        got = raw_queue.pop(rc);
+        pthread_mutex_unlock(&raw_pop_mutex);
+
+        if (!got)
+        {
+            if (dispatch_done.load(std::memory_order_acquire))
+            {
+                // Double-check: acquire fence guarantees visibility of all
+                // dispatcher pushes that happened before dispatch_done was set
+                pthread_mutex_lock(&raw_pop_mutex);
+                got = raw_queue.pop(rc);
+                pthread_mutex_unlock(&raw_pop_mutex);
+                if (!got)
+                    break; // truly done
+            }
+            SwitchToThread();
+            continue;
+        }
+
+        // 1. Compress
+        char compressed_data[DATA_SIZE + 1];
+        size_t compressed_len = sizeof(compressed_data);
+        bool is_compressed = false;
+
+        if (compress_data(rc.data, rc.bytes_read,
+                          compressed_data, compressed_len) == 0)
+        {
+            is_compressed = ((uint8_t)compressed_data[0] == 0x01);
+        }
+        else
+        {
+            memcpy(compressed_data + 1, rc.data, rc.bytes_read);
+            compressed_data[0] = 0x00;
+            compressed_len = rc.bytes_read + 1;
+        }
+
+        // 2. Build packet
+        ReadyPacket rp;
+        memset(&rp.pkt, 0, sizeof(rp.pkt));
+        generate_iv(&rp.pkt.packet_iv);
+
+        // 3. Encrypt
+        char encrypted_data[DATA_SIZE + 1];
+        if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
+                         SHARED_SECRET_KEY, &rp.pkt.packet_iv,
+                         (uint8_t *)encrypted_data))
+        {
+            cerr << " [COMPRESSOR] Encryption failed at seq="
+                 << rc.seq_num << endl;
+            transfer_complete = true;
+            compressors_done.fetch_add(1, std::memory_order_release);
+            return nullptr;
+        }
+
+        rp.pkt.type = rc.is_last ? 3 : 0;
+        rp.pkt.seq_num = rc.seq_num;
+        rp.pkt.chunk_offset = rc.offset;
+        rp.pkt.data_len = (uint16_t)compressed_len;
+        rp.pkt.flags = is_compressed ? 0x01 : 0x00;
+        memset(rp.pkt.hmac, 0, 16);
+        memcpy(rp.pkt.data, encrypted_data, compressed_len);
+
+        // 4. CRC on whole struct (crc32=0, hmac=0) -- server-compatible
+        rp.pkt.crc32 = 0;
+        rp.pkt.crc32 = calculate_crc32(
+            reinterpret_cast<const unsigned char *>(&rp.pkt),
+            sizeof(SlimDataPacket));
+
+        rp.original_len = rc.bytes_read;
+
+        // 5. Push to ready_queue
+        while (!ready_queue.push(rp))
+        {
+            if (transfer_complete)
+            {
+                compressors_done.fetch_add(1, std::memory_order_release);
+                return nullptr;
+            }
+            SwitchToThread();
+        }
+    }
+
+    compressors_done.fetch_add(1, std::memory_order_release);
+    return nullptr;
+}
+
+// ============================================================================
+// STAGE 3: Sender Thread (1 thread)
+// Pops ReadyPackets, reorders by seq_num, serializes, computes HMAC,
+// sends via WSASendTo, records in ARQ.  Reorder buffer ensures packets
+// are sent in strict seq_num order even if compressors finish out of order.
+// ============================================================================
+
+void *sender_thread(void *arg)
+{
+    std::map<uint32_t, ReadyPacket> pending;
+    // Recover starting seq from ARQ send_base (set in main before threads)
+    uint32_t next_send_seq = arq.get_send_base();
 
     while (!transfer_complete)
     {
-        // ── 1. Snapshot ARQ state (one lock for the whole batch check) ──────
-        pthread_mutex_lock(&arq_mutex);
-        int in_flight = arq.get_in_flight_count(); // acquires window_mutex internally
-        uint32_t start_offset = chunk_offset;
-        uint32_t base_seq = arq.get_next_seq_num();
-        pthread_mutex_unlock(&arq_mutex);
+        // 1. Drain ready_queue into reorder buffer
+        ReadyPacket rp;
+        while (ready_queue.pop(rp))
+            pending[rp.pkt.seq_num] = rp;
 
-        bool has_data = (start_offset < (uint32_t)file_size);
-        int free_slots = SR_WINDOW_SIZE - in_flight;
-
-        if (!has_data || free_slots <= 0)
+        // 2. Send packets in strict seq_num order
+        while (pending.count(next_send_seq))
         {
-            Sleep(1);
-            continue;
-        }
-
-        // Congestion-aware batch size: never overfill the window.
-        int batch_size = (free_slots < BURST_SIZE) ? free_slots : BURST_SIZE;
-
-        // ── 2. Build batch outside the lock ───────────────────────────────
-        int pkts_built = 0;
-        uint32_t cur_offset = start_offset;
-        size_t batch_bytes_read = 0;
-
-        for (int b = 0; b < batch_size && cur_offset < (uint32_t)file_size; b++)
-        {
-            // 2a. Read chunk using the persistent handle (no open/close overhead)
-            char chunk_data[DATA_SIZE];
-            infile.seekg(cur_offset);
-            infile.read(chunk_data, DATA_SIZE);
-            size_t bytes_read = (size_t)infile.gcount();
-            if (bytes_read == 0)
-                break;
-
-            // 2b. Compress
-            char compressed_data[DATA_SIZE + 1];
-            size_t compressed_len = sizeof(compressed_data);
-            bool is_compressed = false;
-
-            if (compress_data(chunk_data, bytes_read, compressed_data, compressed_len) == 0)
+            // Wait for ARQ window space
+            while (!transfer_complete)
             {
-                is_compressed = ((uint8_t)compressed_data[0] == 0x01);
+                pthread_mutex_lock(&arq_mutex);
+                int in_flight = arq.get_in_flight_count();
+                pthread_mutex_unlock(&arq_mutex);
+                if (in_flight < SR_WINDOW_SIZE)
+                    break;
+                SwitchToThread();
             }
-            else
-            {
-                memcpy(compressed_data + 1, chunk_data, bytes_read);
-                compressed_data[0] = 0x00; // raw marker
-                compressed_len = bytes_read + 1;
-            }
+            if (transfer_complete)
+                return nullptr;
 
-            // 2c. Build packet header (zero-copy: only update changing fields per burst)
-            SlimDataPacket &arq_pkt = arq_pkts[b];
-            memset(&arq_pkt, 0, sizeof(arq_pkt));
+            ReadyPacket &cur = pending[next_send_seq];
 
-            generate_iv(&arq_pkt.packet_iv); // unique IV per packet — MUST NOT be zeroed
-
-            // 2d. Encrypt compressed payload
-            char encrypted_data[DATA_SIZE + 1];
-            if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
-                             SHARED_SECRET_KEY, &arq_pkt.packet_iv,
-                             (uint8_t *)encrypted_data))
-            {
-                cerr << " [SENDER] Encryption failed at seq=" << (base_seq + b) << endl;
-                transfer_complete = true;
-                goto sender_abort;
-            }
-
-            bool is_last = (cur_offset + bytes_read >= (uint32_t)file_size);
-
-            arq_pkt.type = is_last ? 3 : 0;
-            arq_pkt.seq_num = base_seq + (uint32_t)b;
-            arq_pkt.chunk_offset = cur_offset;
-            arq_pkt.data_len = (uint16_t)compressed_len;
-            arq_pkt.flags = is_compressed ? 0x01 : 0x00;
-            memset(arq_pkt.hmac, 0, 16);
-            memcpy(arq_pkt.data, encrypted_data, compressed_len);
-
-            // 2e. CRC (on host-byte-order struct with crc32=0 and hmac=0)
-            arq_pkt.crc32 = 0;
-            arq_pkt.crc32 = calculate_crc32(
-                reinterpret_cast<const unsigned char *>(&arq_pkt),
-                sizeof(SlimDataPacket));
-
-            // 2f. Wire copy: serialize (byte-swap) then compute HMAC
-            SlimDataPacket &wire = wire_pkts[b];
-            wire = arq_pkt;               // copy host-order packet (with CRC)
-            serialize_slim_packet(&wire); // byte-swap in place for the wire
-            // hmac[] is 16 bytes — memset MUST be exactly 16 (not 32) to avoid
-            // overflowing into data[] and invalidating the CRC just computed.
+            // Wire copy: serialize then HMAC
+            SlimDataPacket wire = cur.pkt;
+            serialize_slim_packet(&wire);
             memset(wire.hmac, 0, 16);
             generate_hmac((const uint8_t *)&wire, sizeof(wire),
                           SHARED_SECRET_KEY, wire.hmac);
-            memcpy(arq_pkt.hmac, wire.hmac, 16); // keep ARQ copy consistent
+            memcpy(cur.pkt.hmac, wire.hmac, 16);
 
-            // 2g. Set up WSABUF — points directly into wire_pkts[] (zero copy)
-            wsabufs[b].buf = reinterpret_cast<CHAR *>(&wire);
-            wsabufs[b].len = sizeof(wire);
-
-            cur_offset += bytes_read;
-            batch_bytes_read += bytes_read;
-            pkts_built++;
-
-            if (is_last)
-                break;
-        }
-
-        if (pkts_built == 0)
-        {
-            Sleep(1);
-            continue;
-        }
-
-        // ── 3. WSASendTo burst — tight loop, minimal context switches ─────
-        int pkts_sent = 0;
-        for (int b = 0; b < pkts_built; b++)
-        {
+            // WSASendTo
+            WSABUF wsabuf;
+            wsabuf.buf = reinterpret_cast<CHAR *>(&wire);
+            wsabuf.len = sizeof(wire);
             DWORD bytes_sent_dword = 0;
+
             int result = WSASendTo(
-                (SOCKET)sockfd, &wsabufs[b], 1, &bytes_sent_dword, 0,
+                (SOCKET)sockfd, &wsabuf, 1, &bytes_sent_dword, 0,
                 reinterpret_cast<SOCKADDR *>(&server_addr), (int)addr_len,
                 NULL, NULL);
 
@@ -294,76 +426,77 @@ void *sender_thread(void *arg)
                 int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK)
                 {
-                    // Socket buffer full — back off and retry remaining later
-                    Sleep(1);
-                    break;
+                    SwitchToThread();
+                    continue; // retry same packet
                 }
                 cerr << " [SENDER] WSASendTo failed: " << err << endl;
                 transfer_complete = true;
-                goto sender_abort;
+                return nullptr;
             }
-            pkts_sent++;
+
+            // Record in ARQ + update counters
+            pthread_mutex_lock(&arq_mutex);
+            arq.record_sent_packet(cur.pkt);
+            arq.increment_seq_num();
+            chunks_sent++;
+            total_bytes_sent += cur.original_len;
+            chunk_offset += (uint32_t)cur.original_len;
+            pthread_mutex_unlock(&arq_mutex);
+
+            pending.erase(next_send_seq);
+            next_send_seq++;
         }
 
-        if (pkts_sent == 0)
+        // 3. Check termination
+        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS && ready_queue.empty() && pending.empty())
         {
-            Sleep(1);
-            continue;
+            pthread_mutex_lock(&arq_mutex);
+            int in_flight = arq.get_in_flight_count();
+            pthread_mutex_unlock(&arq_mutex);
+
+            if (in_flight == 0)
+            {
+                transfer_complete = true;
+                return nullptr;
+            }
         }
 
-        // ── 4. Batch-commit ARQ state (single lock for whole burst) ───────
-        pthread_mutex_lock(&arq_mutex);
-        for (int b = 0; b < pkts_sent; b++)
-        {
-            arq.record_sent_packet(arq_pkts[b]); // host-order copy, correct CRC
-            arq.increment_seq_num();             // advance next_seq_num by 1
-        }
-        chunk_offset += batch_bytes_read;
-        chunks_sent += pkts_sent;
-        total_bytes_sent += batch_bytes_read;
-        pthread_mutex_unlock(&arq_mutex);
+        SwitchToThread();
     }
 
-sender_abort:
-    infile.close();
     return nullptr;
 }
 
 // ----------------------------------------------------------------------------
-// Thread 2: Receiver Thread
+// Receiver Thread (UNCHANGED)
 // ----------------------------------------------------------------------------
 void *receiver_thread(void *arg)
 {
     while (!transfer_complete)
     {
         struct ACKPacket ack_pkt;
-        // memset(&ack_pkt, 0, sizeof(ack_pkt));
 
         int bytes_recv = recvfrom(sockfd, (char *)&ack_pkt, sizeof(ack_pkt), 0,
                                   (struct sockaddr *)&server_addr, &addr_len);
 
         if (bytes_recv > 0)
         {
-            // [FIX Bug 3] Deserialize first so all fields are in host byte order,
-            // then use compute_ack_crc() which correctly excludes the crc32 tail field.
-            // The old code called ntohl(ack_pkt.crc32) BEFORE deserialize_ack_packet(),
-            // which also swaps crc32 — causing a double byte-swap.
             deserialize_ack_packet(&ack_pkt);
-            uint32_t received_crc = ack_pkt.crc32;         // now host order after deserialize
-            uint32_t computed = compute_ack_crc(&ack_pkt); // hashes host-order fields, excludes crc32
+            uint32_t received_crc = ack_pkt.crc32;
+            uint32_t computed = compute_ack_crc(&ack_pkt);
             if (computed == received_crc)
             {
                 if (ack_pkt.ack_num == 0)
                     continue;
                 pthread_mutex_lock(&arq_mutex);
 
-                uint32_t cum = ack_pkt.ack_num;    // cumulative watermark (server's next expected seq)
-                uint64_t sack_bm = ack_pkt.bitmap; // bit i = server has packet (cum + i)
+                uint32_t cum = ack_pkt.ack_num;
+                uint64_t sack_bm = ack_pkt.bitmap;
 
-                // 1. Slide the window: bulk-free all RAM for packets below the watermark
+                // 1. Slide the window
                 arq.handle_cumulative_ack(cum);
 
-                // 2. Mark bitmap-confirmed out-of-order packets as individually acked
+                // 2. Mark bitmap-confirmed out-of-order packets
                 for (int i = 0; i < BITMAP_ACK; i++)
                 {
                     if (sack_bm & (1u << i))
@@ -375,8 +508,7 @@ void *receiver_thread(void *arg)
                 if (arq.get_in_flight_count() > 1000)
                     total_inflights++;
 
-                // 3. Fast retransmit: scan bitmap for holes below the highest received bit
-                //    e.g. bitmap = 0b1101 → cum+0, cum+2 received; cum+1 is a hole → retransmit now
+                // 3. Fast retransmit: scan bitmap for holes
                 int highest_bit = -1;
                 for (int i = ((sizeof(sack_bm) * 8) - 1); i >= 0; i--)
                 {
@@ -401,8 +533,7 @@ void *receiver_thread(void *arg)
 
                 pthread_mutex_unlock(&arq_mutex);
 
-                // 5. Fast retransmit outside the lock — prepare_retransmit re-acquires
-                //    window_mutex internally, no deadlock with arq_mutex.
+                // 5. Fast retransmit outside the lock
                 for (int i = 0; i < fast_retransmit_count; i++)
                 {
                     SlimDataPacket rpkt;
@@ -419,29 +550,22 @@ void *receiver_thread(void *arg)
             else
             {
                 cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack_pkt.ack_num << endl;
-                // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
             }
-            // Ignore WSAETIMEDOUT / WSAEWOULDBLOCK — just loop again
         }
     }
     return nullptr;
 }
+
 // ----------------------------------------------------------------------------
-// Thread 3: Timeout Thread
-// [CHANGED] SR checks timeouts per-packet and retransmits only the timed-out
-//           packet (not the whole window like GBN). API is also different:
-//           check_for_timeout() returns a seq_num (0 = none), then
-//           prepare_retransmit() resets the timer and gives back the packet.
+// Timeout Thread (UNCHANGED)
 // ----------------------------------------------------------------------------
 void *timeout_thread(void *arg)
 {
     while (!transfer_complete)
     {
-        // [CHANGED] Must be uint32_t to handle 1GB files (947,000+ packets)
         uint32_t timed_out_seq = 0;
 
         pthread_mutex_lock(&arq_mutex);
-        // SR returns the 32-bit seq_num of the first timed-out packet (0 = none)
         timed_out_seq = arq.check_for_timeout();
         pthread_mutex_unlock(&arq_mutex);
 
@@ -477,15 +601,13 @@ void *timeout_thread(void *arg)
 
         // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
         // a 1ms sleep makes the client respond to loss much faster.
-        Sleep(1);
+        Sleep(5);
     }
     return nullptr;
 }
 
 // ----------------------------------------------------------------------------
-// Thread 4: Logger Thread
-// [CHANGED] Removed GBN-specific cwnd and EWMA RTT (not in SR).
-//           Logs window fill level and packet counts instead.
+// Logger Thread (UNCHANGED -- currently disabled)
 // ----------------------------------------------------------------------------
 void *logger_thread(void *arg)
 {
@@ -514,7 +636,7 @@ void *logger_thread(void *arg)
 // ----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    cout << " LinkFlow Phase 4 Client Starting (Selective Repeat ARQ)..." << endl;
+    cout << " LinkFlow Phase 5 Client Starting (3-Stage Pipeline + SR ARQ)..." << endl;
     cout << "CRC32 hardware acceleration: "
          << (has_hw_crc32() ? "ENABLED (SSE4.2)" : "fallback (slicing-by-8)")
          << endl;
@@ -542,6 +664,7 @@ int main(int argc, char *argv[])
     if (file_size < 0)
     {
         cerr << " Cannot open file: " << filename_str << endl;
+        std::cerr << "Reason1: " << std::strerror(errno) << std::endl;
         return 1;
     }
 
@@ -556,11 +679,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // 50ms receive timeout so receiver_thread doesn't block forever
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = RECV_TIMEOUT * 1000;           // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
-    int buffer_size = SOC_BUFFER * 1024 * 1024; // 16 MB
+    int buffer_size = SOC_BUFFER * 1024 * 1024; // 64 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -577,7 +699,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms" << endl;
+    cout << " SR Window=" << SR_WINDOW_SIZE << ", RTO=" << SR_PACKET_TIMEOUT_MS << "ms"
+         << ", Pipeline=" << COMPRESSOR_THREADS << " compressors" << endl;
 
     // Check for resume checkpoint
     uint32_t starting_seq = 1;
@@ -614,7 +737,12 @@ int main(int argc, char *argv[])
     chunk_offset = starting_offset;
     arq.set_start_seq(starting_seq);
 
-    cout << "\n Starting Multithreaded Selective Repeat Transmission...\n"
+    // Initialize pipeline atomics for resume support
+    dispatch_seq.store(starting_seq, std::memory_order_relaxed);
+    dispatch_done.store(false, std::memory_order_relaxed);
+    compressors_done.store(0, std::memory_order_relaxed);
+
+    cout << "\n Starting 3-Stage Pipeline Selective Repeat Transmission...\n"
          << endl;
 
     auto start_time = chrono::high_resolution_clock::now();
@@ -637,9 +765,8 @@ int main(int argc, char *argv[])
                          (struct sockaddr *)&server_addr, &addr_len);
         if (r > 0)
         {
-            // [FIX Bug 3] Same pattern as receiver_thread — deserialize first.
             deserialize_ack_packet(&ack);
-            uint32_t received_crc = ack.crc32; // host order after deserialize
+            uint32_t received_crc = ack.crc32;
             uint32_t computed = compute_ack_crc(&ack);
 
             if (computed == received_crc && ack.ack_num == 0 && ack.type == 1)
@@ -655,7 +782,7 @@ int main(int argc, char *argv[])
         auto elapsed = chrono::steady_clock::now() - handshake_start;
         if (chrono::duration_cast<chrono::milliseconds>(elapsed).count() > 1000)
         {
-            cout << "[CLIENT] No handshake response — retrying StartPacket..." << endl;
+            cout << "[CLIENT] No handshake response -- retrying StartPacket..." << endl;
             StartPacket start_pkt;
             start_pkt.type = 2;
             start_pkt.file_size = file_size;
@@ -667,12 +794,23 @@ int main(int argc, char *argv[])
             handshake_start = chrono::steady_clock::now();
         }
     }
-    pthread_t t_sender, t_receiver, t_timeout, t_logger;
+
+    // ---- Launch 3-stage pipeline + receiver + timeout threads ----
+    pthread_t t_dispatcher;
+    pthread_t t_compressors[COMPRESSOR_THREADS];
+    pthread_t t_sender, t_receiver, t_timeout;
+
+    pthread_create(&t_dispatcher, nullptr, dispatcher_thread, nullptr);
+    for (int i = 0; i < COMPRESSOR_THREADS; i++)
+        pthread_create(&t_compressors[i], nullptr, compressor_thread, nullptr);
     pthread_create(&t_sender, nullptr, sender_thread, nullptr);
     pthread_create(&t_receiver, nullptr, receiver_thread, nullptr);
     pthread_create(&t_timeout, nullptr, timeout_thread, nullptr);
     // pthread_create(&t_logger, nullptr, logger_thread, nullptr);
 
+    pthread_join(t_dispatcher, nullptr);
+    for (int i = 0; i < COMPRESSOR_THREADS; i++)
+        pthread_join(t_compressors[i], nullptr);
     pthread_join(t_sender, nullptr);
     pthread_join(t_receiver, nullptr);
     pthread_join(t_timeout, nullptr);

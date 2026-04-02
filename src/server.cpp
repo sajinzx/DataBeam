@@ -15,8 +15,11 @@
 #include "./headers/compress.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
+#include <chrono>
+#include <atomic>
+#include <vector>
 using namespace std;
-#define BUFFER_SIZE 8192 // Enough for 512 packets in flight (assuming 8KB window) increase i window increase the buffer size to accomodate more packets in flight
+#define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window) increase i window increase the buffer size to accomodate more packets in flight
 #define ACK_BATCH_SIZE 32
 #define RECV_TIMEOUT 1000
 #define SOC_BUFFER 128
@@ -26,9 +29,6 @@ struct WorkItem
     SlimDataPacket pkt;
     size_t compressed_len;
 };
-#include <chrono>
-#include <atomic>
-#include <vector>
 
 struct PerfStats
 {
@@ -180,9 +180,9 @@ void *worker_thread(void *arg)
     // Contiguous decompressed packets are accumulated here; a single seekp+write
     // fires per bunch instead of per packet (~32× fewer disk syscalls per burst).
     static const size_t BUNCH_CAPACITY = 1u * 1024u * 1024u; // 1 MB
-    char    *bunch_buffer       = new char[BUNCH_CAPACITY];
-    size_t   bunch_size         = 0;         // bytes staged in bunch_buffer
-    uint64_t bunch_start_offset = 0;         // file offset of bunch_buffer[0]
+    char *bunch_buffer = new char[BUNCH_CAPACITY];
+    size_t bunch_size = 0;           // bytes staged in bunch_buffer
+    uint64_t bunch_start_offset = 0; // file offset of bunch_buffer[0]
 
     while (!server_done)
     {
@@ -237,7 +237,7 @@ void *worker_thread(void *arg)
         {
             // ── Start a new bunch at the trigger packet's file offset ─────
             bunch_start_offset = pkt.chunk_offset;
-            bunch_size         = 0;
+            bunch_size = 0;
 
             // Helper lambda: flush the current bunch in one seekp+write.
             // Defined as a local variable (C++11 generic lambda with captures).
@@ -344,7 +344,6 @@ cleanup:
     cout << "[WORKER] Worker thread exiting." << endl;
     return nullptr;
 }
-
 
 int main()
 {

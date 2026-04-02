@@ -8,7 +8,7 @@
 #include "./crchw.h" // For CRC32 calculation
 #define PORT 12345
 #define DATA_SIZE 1440 // 1500 - 20 (IP) - 8 (UDP) - 32 (custom header)
-#define MAX_FILENAME 50
+#define MAX_FILENAME 256
 #define USERNAME_MAX 32
 #pragma pack(push, 1)
 static inline uint64_t htonll_portable(uint64_t v)
@@ -44,7 +44,7 @@ struct SlimDataPacket
 
     uint8_t flags;         // 1 byte  (Bit 0: Encrypted, Bit 1-2: Stream ID)
     uint16_t reserved;     // 2 bytes (Padding for 4-byte alignment)
-    uint32_t chunk_offset; // 4 bytes (Offset within the file)
+    uint32_t chunk_offset; // 4 bytes (Offset within the file)    max 4bg of dta can be transmitted
     // --- Phase 7 Security Hook (Reserved) ---
     uint64_t packet_iv; // 8 bytes (Nonce for AES-GCM)
     uint8_t hmac[16];   // 16 bytes (Auth tag)
@@ -60,8 +60,8 @@ struct StartPacket
     uint8_t type;          // Always 2
     uint32_t file_size;    // Total file size
     uint32_t total_chunks; // Total number of packets
-    char filename[256];    // "stranger_things_s01e01.mkv"
-    char username[32];     // "student_id_123"
+    char filename[MAX_FILENAME];    // "stranger_things_s01e01.mkv"
+    char username[USERNAME_MAX];     // "student_id_123"
     uint16_t window_size;  // Initial negotiated window
 };
 #pragma pack(pop)

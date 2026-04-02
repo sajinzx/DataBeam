@@ -86,4 +86,13 @@ struct MPRingBuf
         tail.store((t + 1) & (CAP - 1), std::memory_order_release);
         return true;
     }
+
+    size_t size() const noexcept
+    {
+        size_t h = head.load(std::memory_order_acquire);
+        size_t t = tail.load(std::memory_order_acquire);
+        return (h - t) & (CAP - 1);
+    }
+
+    bool empty() const noexcept { return size() == 0; }
 };
