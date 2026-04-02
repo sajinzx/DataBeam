@@ -16,6 +16,7 @@
 #include <fstream>
 #include <chrono>
 #include <zlib.h>
+#include <intrin.h>
 #include <pthread.h>
 #include "./headers/packet.h"
 #include "./headers/selectrepeat.h"
@@ -24,19 +25,20 @@
 #include "./headers/crypto.h"
 #include "./headers/ringbuf.h"
 #include <filesystem> // C++17
-
 #include <atomic>
 #include <vector>
 #include <map>
 #include <sys/stat.h>
 
-#define BITMAP_ACK 64   // Bitmap ACKs cover 64 packets beyond the cumulative ACK
+#define BITMAP_ACK 512   // Bitmap ACKs cover 1024 packets beyond the cumulative ACK
 #define SOC_BUFFER 128  // Socket buffer size in MB (both send and receive)
 #define RECV_TIMEOUT 30 // 30-second recv timeout for ACKs
-#define BITMAP_SIZE 64  // Bitmap size ACKs cover 64 packets beyond the cumulative ACK
+#define BITMAP_SIZE 512  // Bitmap size ACKs cover 1024 packets beyond the cumulative ACK set 20% of window size
 // Number of compressor threads -- tune to CPU core count
 #define COMPRESSOR_THREADS 6 // increase to 8 on 8+ core machines
 using namespace std;
+static const size_t RAW_Q_CAP = 4096;
+static const size_t READY_Q_CAP = 4096;
 
 struct ClientPerf
 {
@@ -45,7 +47,10 @@ struct ClientPerf
     std::atomic<long long> total_compress_us{0};
     std::atomic<long long> total_crypto_us{0}; // AES-GCM time
     std::atomic<long long> total_send_syscall_us{0};
-
+    std::atomic<long long> total_lock_wait_us{0};   // Time spent waiting for arq_mutex
+    std::atomic<long long> total_bit_scan_us{0};    // Time spent processing the 512-bit bitmap
+    std::atomic<long long> total_ack_send_us{0};
+    std::atomic<uint32_t> acks_processed{0};
     // Waiting/Blocking Metrics
     std::atomic<long long> total_window_wait_us{0}; // Time spent waiting for ACKs/Window Slide
 
@@ -92,6 +97,10 @@ void print_client_report()
               << " (If high, use Batch/WSASendTo)" << std::endl;
 
     std::cout << "Window Full Count: " << g_cperf.window_full_events << std::endl;
+    uint32_t ack_count = g_cperf.acks_processed.load();
+    std::cout << "Lock Contention: " << (double)g_cperf.total_lock_wait_us / ack_count << " us" << std::endl;
+    std::cout << "Bit Scanning:   " << (double)g_cperf.total_bit_scan_us / ack_count << " us" << std::endl;
+    std::cout << "ACK Syscall:    " << (double)g_cperf.total_ack_send_us / ack_count << " us" << std::endl;
     std::cout << "------------------------------------------------------" << std::endl;
 }
 // ----------------------------------------------------------------------------
@@ -147,24 +156,24 @@ struct ReadyPacket
 struct ReorderSlot
 {
     ReadyPacket pkt;
-    bool        valid = false;
+    bool valid = false;
 };
 
 static_assert((SR_WINDOW_SIZE & (SR_WINDOW_SIZE - 1)) == 0,
               "SR_WINDOW_SIZE must be power of 2");
-static const uint32_t REORDER_CAP  = SR_WINDOW_SIZE; // 4096
+static const uint32_t REORDER_CAP = SR_WINDOW_SIZE; // 4096
 static const uint32_t REORDER_MASK = REORDER_CAP - 1;
 
 struct ReorderBuf
 {
     ReorderSlot slots[REORDER_CAP];
-    uint32_t    pending_count = 0; // how many valid slots are occupied
+    uint32_t pending_count = 0; // how many valid slots are occupied
 
     // Store a packet -- O(1)
     void insert(uint32_t seq, const ReadyPacket &rp)
     {
         uint32_t idx = seq & REORDER_MASK;
-        slots[idx].pkt   = rp;
+        slots[idx].pkt = rp;
         slots[idx].valid = true;
         pending_count++;
     }
@@ -194,9 +203,6 @@ struct ReorderBuf
 // ---- Pipeline queues -------------------------------------------------------
 // Raw queue: dispatcher -> compressor threads (SPMC: one dispatcher, N compressors)
 // Ready queue: compressor threads -> sender thread (MPSC: N compressors, one sender)
-
-static const size_t RAW_Q_CAP = 4096;
-static const size_t READY_Q_CAP = 4096;
 
 // Raw queue uses mutex pop (multiple compressors pop, one dispatcher pushes)
 RingBuf<RawChunk, RAW_Q_CAP> raw_queue;
@@ -270,8 +276,10 @@ void *dispatcher_thread(void *arg)
 
         // Read one chunk
         RawChunk rc;
+        long long t_read = g_cperf.now_us();
         infile.seekg(local_offset);
         infile.read(rc.data, DATA_SIZE);
+        g_cperf.total_disk_read_us.fetch_add(g_cperf.now_us() - t_read, std::memory_order_relaxed);
         rc.bytes_read = (size_t)infile.gcount();
         if (rc.bytes_read == 0)
             break;
@@ -336,6 +344,7 @@ void *compressor_thread(void *arg)
         size_t compressed_len = sizeof(compressed_data);
         bool is_compressed = false;
 
+        long long t_comp = g_cperf.now_us();
         if (compress_data(rc.data, rc.bytes_read,
                           compressed_data, compressed_len) == 0)
         {
@@ -347,6 +356,7 @@ void *compressor_thread(void *arg)
             compressed_data[0] = 0x00;
             compressed_len = rc.bytes_read + 1;
         }
+        g_cperf.total_compress_us.fetch_add(g_cperf.now_us() - t_comp, std::memory_order_relaxed);
 
         // 2. Build packet
         ReadyPacket rp;
@@ -355,6 +365,7 @@ void *compressor_thread(void *arg)
 
         // 3. Encrypt
         char encrypted_data[DATA_SIZE + 1];
+        long long t_crypto = g_cperf.now_us();
         if (!aes_encrypt((const uint8_t *)compressed_data, compressed_len,
                          SHARED_SECRET_KEY, &rp.pkt.packet_iv,
                          (uint8_t *)encrypted_data))
@@ -365,6 +376,7 @@ void *compressor_thread(void *arg)
             compressors_done.fetch_add(1, std::memory_order_release);
             return nullptr;
         }
+        g_cperf.total_crypto_us.fetch_add(g_cperf.now_us() - t_crypto, std::memory_order_relaxed);
 
         rp.pkt.type = rc.is_last ? 3 : 0;
         rp.pkt.seq_num = rc.seq_num;
@@ -412,9 +424,8 @@ void *compressor_thread(void *arg)
 
 void *sender_thread(void *arg)
 {
-    // Stack-allocated reorder buffer -- no heap, ~9 MB on stack (within 64MB limit)
-    // If stack is tight, move to static or thread-local storage.
-    ReorderBuf pending;
+    // Heap-allocated reorder buffer -- ~6 MB, avoids Windows 1MB thread stack overflow crash
+    auto pending = std::make_unique<ReorderBuf>();
 
     // Recover starting seq from ARQ send_base (honours resume checkpoint)
     uint32_t next_send_seq = arq.get_send_base();
@@ -424,10 +435,10 @@ void *sender_thread(void *arg)
         // ---- 1. Drain ready_queue into circular reorder buffer (O(1) each) --
         ReadyPacket rp;
         while (ready_queue.pop(rp))
-            pending.insert(rp.pkt.seq_num, rp);
+            pending->insert(rp.pkt.seq_num, rp);
 
         // ---- 2. Send packets in strict seq_num order ----------------------
-        while (pending.has(next_send_seq))
+        while (pending->has(next_send_seq))
         {
             // Window-space check: only lock when the window might be full
             pthread_mutex_lock(&arq_mutex);
@@ -438,6 +449,7 @@ void *sender_thread(void *arg)
             {
                 // Window full -- spin until an ACK slides it
                 g_cperf.window_full_events.fetch_add(1, std::memory_order_relaxed);
+                long long t_wait = g_cperf.now_us();
                 while (!transfer_complete)
                 {
                     SwitchToThread();
@@ -447,11 +459,13 @@ void *sender_thread(void *arg)
                     if (in_flight < SR_WINDOW_SIZE)
                         break;
                 }
+                g_cperf.total_window_wait_us.fetch_add(
+                    g_cperf.now_us() - t_wait, std::memory_order_relaxed);
             }
             if (transfer_complete)
                 return nullptr;
 
-            ReadyPacket &cur = pending.get(next_send_seq);
+            ReadyPacket &cur = pending->get(next_send_seq);
 
             // Wire copy: byte-swap then HMAC (cur.pkt stays host-order for ARQ)
             SlimDataPacket wire = cur.pkt;
@@ -499,13 +513,12 @@ void *sender_thread(void *arg)
 
             g_cperf.packets_sent.fetch_add(1, std::memory_order_relaxed);
 
-            pending.erase(next_send_seq); // O(1) -- just clears valid flag
+            pending->erase(next_send_seq); // O(1) -- just clears valid flag
             next_send_seq++;
         }
 
         // ---- 3. Termination check ----------------------------------------
-        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS
-            && ready_queue.empty() && pending.empty())
+        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS && ready_queue.empty() && pending->empty())
         {
             pthread_mutex_lock(&arq_mutex);
             int in_flight = arq.get_in_flight_count();
@@ -538,6 +551,7 @@ void *receiver_thread(void *arg)
 
         if (bytes_recv > 0)
         {
+            long long t_start = ClientPerf::now_us();
             deserialize_ack_packet(&ack_pkt);
             uint32_t received_crc = ack_pkt.crc32;
             uint32_t computed = compute_ack_crc(&ack_pkt);
@@ -546,63 +560,64 @@ void *receiver_thread(void *arg)
                 if (ack_pkt.ack_num == 0)
                     continue;
                 pthread_mutex_lock(&arq_mutex);
-
+                long long t_locked = ClientPerf::now_us();
                 uint32_t cum = ack_pkt.ack_num;
-                uint64_t sack_bm = ack_pkt.bitmap;
 
                 // 1. Slide the window
                 arq.handle_cumulative_ack(cum);
-
-                // 2. Mark bitmap-confirmed out-of-order packets
-                for (int i = 0; i < BITMAP_ACK; i++)
-                {
-                    if (sack_bm & (1u << i))
-                        arq.mark_packet_acked(cum + (uint32_t)i);
-                }
-                arq.advance_window();
+                uint32_t fast_retransmit_seqs[BITMAP_ACK];
+                int fast_retransmit_count = 0;
+                for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {
+                    uint64_t chunk = ack_pkt.bitmap[chunk_idx];
+                    if (chunk == 0xFFFFFFFFFFFFFFFFULL) {
+                        // Mark the whole 64-packet block as ACKed
+                        for(int b=0; b<64; b++) 
+                            arq.mark_packet_acked(cum + (chunk_idx * 64) + b);
+                    }
+                    else if (chunk != 0) {
+                        // Only loop if there's a mix of ACKs and Holes
+                        for (int bit = 0; bit < 64; bit++) {
+                            if (chunk & (1ULL << bit)) 
+                                arq.mark_packet_acked(cum + (chunk_idx * 64) + bit);
+                        }
+                    }
+                
+                
+                
                 acks_received++;
 
                 if (arq.get_in_flight_count() > 1000)
                     total_inflights++;
 
-                // 3. Fast retransmit: scan bitmap for holes
-                int highest_bit = -1;
-                for (int i = ((sizeof(sack_bm) * 8) - 1); i >= 0; i--)
-                {
-                    if (sack_bm & (1u << i))
-                    {
-                        highest_bit = i;
-                        break;
-                    }
+                uint64_t holes = ~chunk; // Flip bits: 0s (holes) become 1s
+                unsigned long bit_pos;
+                // _BitScanForward64 finds the first '1' (our hole) in 1 clock cycle
+                while (_BitScanForward64(&bit_pos, holes)) {
+                    fast_retransmit_seqs[fast_retransmit_count++] = cum + (chunk_idx * 64) + bit_pos;
+                    holes &= ~(1ULL << bit_pos); // Clear this hole to find the next one
+                    if (holes == 0) break;
                 }
-
-                uint32_t fast_retransmit_seqs[BITMAP_SIZE];
-                int fast_retransmit_count = 0;
-                for (int i = 0; i < highest_bit; i++)
-                {
-                    if (!(sack_bm & (1u << i)))
-                        fast_retransmit_seqs[fast_retransmit_count++] = cum + (uint32_t)i;
-                }
-
-                // 4. Check transfer completion
-                if (chunk_offset >= (uint32_t)file_size && arq.get_in_flight_count() == 0)
-                    transfer_complete = true;
-
+            }
+                arq.advance_window();
                 pthread_mutex_unlock(&arq_mutex);
+                // fast retransmission checking
+                long long t_scan_done = ClientPerf::now_us();
 
-                // 5. Fast retransmit outside the lock
-                for (int i = 0; i < fast_retransmit_count; i++)
-                {
+                // 5. Retransmit OUTSIDE the lock to keep the Sender thread moving
+                for (int i = 0; i < fast_retransmit_count; i++) {
                     SlimDataPacket rpkt;
-                    if (arq.prepare_retransmit(fast_retransmit_seqs[i], rpkt))
-                    {
-                        SlimDataPacket pkt_send = rpkt;
-                        serialize_slim_packet(&pkt_send);
-                        sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
+                    if (arq.prepare_retransmit(fast_retransmit_seqs[i], rpkt)) {
+                        serialize_slim_packet(&rpkt);
+                        sendto(sockfd, (const char *)&rpkt, sizeof(rpkt), 0,
                                (struct sockaddr *)&server_addr, addr_len);
                         retransmissions++;
                     }
                 }
+    
+                // 6. Update Receiver Performance Metrics
+                g_cperf.total_lock_wait_us += (t_locked - t_start);
+                g_cperf.total_bit_scan_us += (t_scan_done - t_locked);
+                g_cperf.acks_processed++;
             }
             else
             {
@@ -889,4 +904,5 @@ int main(int argc, char *argv[])
     cout << "   - Throughput:               " << throughput << " Mbps" << endl;
     cout << "   - Max in-flight packets:    " << total_inflights << endl;
     cout << "   - Total retransmissions:    " << retransmissions << endl;
+    print_client_report();
 }

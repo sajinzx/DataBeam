@@ -440,7 +440,7 @@ int main()
             memset(&start_ack, 0, sizeof(start_ack));
             start_ack.type = 1;
             start_ack.ack_num = 0; // 0 = handshake ACK (not a data ACK)
-            start_ack.bitmap = 0;
+            memset(start_ack.bitmap, 0, sizeof(start_ack.bitmap));
 
             // BUG FIX 2: compute CRC on host-order fields BEFORE serializing
             start_ack.crc32 = calculate_crc32(
@@ -549,20 +549,22 @@ int main()
 
             if (send_sack)
             {
-                // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
-                uint64_t sack_bm = 0;
-                for (int i = 0; i < 16; i++)
-                {
-                    uint32_t c = ack_seq + (uint32_t)i;
-                    if (recv_mark[c % BUFFER_SIZE] == c)
-                        sack_bm |= (uint64_t)(1u << i);
-                }
-
                 ACKPacket sack;
                 memset(&sack, 0, sizeof(sack));
                 sack.type = 1;
                 sack.ack_num = ack_seq; // cumulative watermark
-                sack.bitmap = sack_bm;
+                
+                // Build SACK bitmap: bit i = 1 if (ack_seq + i) already buffered
+                for (int i = 0; i < 256; i++)
+                {
+                    uint32_t c = ack_seq + (uint32_t)i;
+                    if (recv_mark[c % BUFFER_SIZE] == c)
+                    {
+                        int chunk_idx = i / 64;
+                        int bit_idx = i % 64;
+                        sack.bitmap[chunk_idx] |= (1ULL << bit_idx);
+                    }
+                }
                 sack.crc32 = calculate_crc32(
                     reinterpret_cast<const unsigned char *>(&sack),
                     sizeof(ACKPacket) - sizeof(uint32_t));

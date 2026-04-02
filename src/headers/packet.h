@@ -27,7 +27,7 @@ static inline uint64_t ntohll_portable(uint64_t v)
 struct ACKPacket
 {
     uint32_t ack_num; // The sequence number being acknowledged
-    uint64_t bitmap;  // For Selective Repeat (which neighbors are also here) // increase teh bitmap size based on window size
+    uint64_t bitmap[4];  // For Selective Repeat (which neighbors are also here) // increase teh bitmap size based on window size
     uint8_t type;     // Always set to 1 (ACK)
     uint32_t crc32;   // Integrity check for the ACK itself
 };
@@ -57,12 +57,12 @@ struct SlimDataPacket
 #pragma pack(push, 1)
 struct StartPacket
 {
-    uint8_t type;          // Always 2
-    uint32_t file_size;    // Total file size
-    uint32_t total_chunks; // Total number of packets
-    char filename[MAX_FILENAME];    // "stranger_things_s01e01.mkv"
-    char username[USERNAME_MAX];     // "student_id_123"
-    uint16_t window_size;  // Initial negotiated window
+    uint8_t type;                // Always 2
+    uint32_t file_size;          // Total file size
+    uint32_t total_chunks;       // Total number of packets
+    char filename[MAX_FILENAME]; // "stranger_things_s01e01.mkv"
+    char username[USERNAME_MAX]; // "student_id_123"
+    uint16_t window_size;        // Initial negotiated window
 };
 #pragma pack(pop)
 // Serialize packet: convert host byte order to network byte order
@@ -110,14 +110,18 @@ inline void deserialize_start_packet(struct StartPacket *pkt)
 inline void serialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = htonl(pkt->ack_num);
-    pkt->bitmap = htons(pkt->bitmap);
+    for(int i = 0; i < 4; i++) {
+        pkt->bitmap[i] = htonll(pkt->bitmap[i]);
+    }
     pkt->crc32 = htonl(pkt->crc32);
 }
 
 inline void deserialize_ack_packet(struct ACKPacket *pkt)
 {
     pkt->ack_num = ntohl(pkt->ack_num);
-    pkt->bitmap = ntohs(pkt->bitmap);
+    for(int i = 0; i < 4; i++) {
+        pkt->bitmap[i] = ntohll(pkt->bitmap[i]);
+    }
     pkt->crc32 = ntohl(pkt->crc32);
 }
 #endif

@@ -17,7 +17,7 @@
 #define SR_WINDOW_SIZE 4096     // Sliding window size
 #define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout (ms)
 #define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
-#define ACK_BATCH_SIZE 30       // Server sends SACK every N in-order packets
+#define ACK_BATCH_SIZE 256      // Server sends SACK every N in-order packets
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
 struct WindowPacket
