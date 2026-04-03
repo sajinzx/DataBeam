@@ -12,10 +12,10 @@
 #include <pthread.h>
 #include <cstdint>
 #include <cstring>
-
+#include <atomic>
 // Constants for Selective Repeat ARQ
 #define SR_WINDOW_SIZE 4096     // Sliding window size
-#define SR_PACKET_TIMEOUT_MS 50 // Individual packet timeout (ms)
+#define SR_PACKET_TIMEOUT_MS 100 // Individual packet timeout (ms)
 #define SR_MAX_RETRANSMITS 200  // Max retransmit attempts per packet
 #define ACK_BATCH_SIZE 256      // Server sends SACK every N in-order packets
 
@@ -44,11 +44,14 @@ private:
     uint32_t next_seq_num;                  // Next packet to send
     std::bitset<SR_WINDOW_SIZE> ack_bitmap; // ACK status: bit i = acked(base+i)?
 
-    // Packet buffer: map from seq_num to WindowPacket — [FIX Bug 4] uint32_t key
-    std::map<uint32_t, WindowPacket> window_buffer;
+    // Packet buffer: Pre-allocated circular array (O(1) access, zero heap churn)
+    // Size is SR_WINDOW_SIZE (4096). Indexed by (seq_num & (SR_WINDOW_SIZE - 1)).
+    WindowPacket window_buffer[SR_WINDOW_SIZE];
+    bool slot_occupied[SR_WINDOW_SIZE]; // Tracks if a slot contains an unacked packet
+    std::atomic<int> in_flight_count;   // O(1) tracking of buffered packets
 
     // Thread synchronization
-    mutable pthread_mutex_t window_mutex; // Protects window_buffer and state variables
+    mutable pthread_mutex_t window_mutex; // Protects window state
 
     // RTT & Timeout (optional congestion control integration)
     uint32_t rto_ms; // Retransmission timeout in milliseconds
@@ -100,7 +103,7 @@ public:
     // === Statistics & Debugging ===
     uint32_t get_window_size() const { return SR_WINDOW_SIZE; }
     uint8_t get_acked_count() const { return ack_bitmap.count(); }
-    bool is_window_empty() const { return window_buffer.empty(); }
+    bool is_window_empty() const { return get_in_flight_count() == 0; }
     bool is_packet_acked(uint32_t seq_num) const;
 
     // Print current window state (for debugging)

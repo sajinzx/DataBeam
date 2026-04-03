@@ -18,11 +18,12 @@
 #include <chrono>
 #include <atomic>
 #include <vector>
+#include <csignal>
 using namespace std;
 #define BUFFER_SIZE 4096 // Enough for 512 packets in flight (assuming 8KB window) increase i window increase the buffer size to accomodate more packets in flight
-#define ACK_BATCH_SIZE 32
+#define ACK_BATCH_SIZE 128
 #define RECV_TIMEOUT 1000
-#define SOC_BUFFER 128
+#define SOC_BUFFER 16
 // Work queue — holds CRC-verified raw packets waiting to be decompressed
 struct WorkItem
 {
@@ -57,6 +58,14 @@ queue<WorkItem> work_queue;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 volatile bool server_done = false;
+
+void handle_sigint(int sig)
+{
+    cout << "\n[SERVER] Caught signal " << sig << ", shutting down gracefully..." << endl;
+    server_done = true;
+    pthread_cond_signal(&queue_cond);
+}
+
 pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 string shared_filename = "";
 uint32_t shared_file_size = 0;
@@ -155,6 +164,10 @@ void *worker_thread(void *arg)
     {
         Sleep(3);
     }
+    if (!start_received) {
+        cout << "[WORKER] Shutting down before any file transfer started." << endl;
+        return nullptr;
+    }
     pthread_mutex_lock(&init_mutex);
     string current_filename = shared_filename;
     uint32_t total_file_size = shared_file_size;
@@ -162,19 +175,34 @@ void *worker_thread(void *arg)
 
     string out_filepath = "received/recv_" + current_filename;
 
-    ofstream outfile(out_filepath, ios::binary | ios::out | ios::trunc);
+    uint32_t expected_seq_num = load_checkpoint(current_filename);
+    if (expected_seq_num == 0) expected_seq_num = 1;
+
+    ofstream outfile;
+    if (expected_seq_num > 1) {
+        outfile.open(out_filepath, ios::binary | ios::out | ios::in);
+        if (!outfile.is_open()) {
+            expected_seq_num = 1;
+            outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+        }
+    } else {
+        outfile.open(out_filepath, ios::binary | ios::out | ios::trunc);
+    }
+
     if (!outfile.is_open())
     {
         cerr << "[WORKER] Cannot create: " << out_filepath << endl;
         server_done = true;
         return nullptr;
     }
-    cout << "[WORKER] File opened: " << out_filepath << endl;
+    cout << "[WORKER] File opened: " << out_filepath << ". Expecting seq=" << expected_seq_num << endl;
+    
     // this was used in phase 3 for GBN, we can reuse the same pool for SR since it's just a buffer of decoded packets. The logic of how we fill and drain it changes, but the underlying storage can be the same.
 
     PoolSlot *pool = new PoolSlot[BUFFER_SIZE];
     memset(pool, 0, sizeof(PoolSlot) * BUFFER_SIZE);
-    uint32_t expected_seq_num = 1; // [CRITICAL] Must be 32-bit for 1GB files
+    
+    bool transfer_success = false;
 
     // ── Staging bunch buffer (1 MB) ──────────────────────────────────────────
     // Contiguous decompressed packets are accumulated here; a single seekp+write
@@ -309,6 +337,7 @@ void *worker_thread(void *arg)
             // ── EOF: close file and signal done ───────────────────────────
             if (hit_eof || pkt.type == 3)
             {
+                transfer_success = true;
                 outfile.flush();
                 outfile.close();
                 remove("resume.json");
@@ -339,6 +368,18 @@ void *worker_thread(void *arg)
         // pkt.seq_num < expected_seq_num → duplicate, ignore
     }
 cleanup:
+    if (!transfer_success && expected_seq_num > 1) {
+         if (bunch_size > 0 && outfile.is_open()) {
+             outfile.seekp((streamoff)bunch_start_offset, ios::beg);
+             outfile.write(bunch_buffer, (streamsize)bunch_size);
+         }
+         if (outfile.is_open()) {
+             outfile.flush();
+             outfile.close();
+         }
+         save_checkpoint(current_filename, expected_seq_num);
+         cout << "[WORKER] Saved checkpoint abruptly at seq=" << expected_seq_num << endl;
+    }
     delete[] pool;
     delete[] bunch_buffer;
     cout << "[WORKER] Worker thread exiting." << endl;
@@ -347,6 +388,7 @@ cleanup:
 
 int main()
 {
+    signal(SIGINT, handle_sigint);
     cout << " DataBeam Phase 4 Server Starting..." << endl;
     SetConsoleOutputCP(CP_UTF8);
 
@@ -372,8 +414,8 @@ int main()
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buf_size, sizeof(buf_size));
 
     // FIX: 1ms recv timeout — server must be responsive for ACK sending
-    struct timeval tv = {0, RECV_TIMEOUT};
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    DWORD recv_timeout_ms = RECV_TIMEOUT;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout_ms, sizeof(recv_timeout_ms));
 
     struct sockaddr_in server_addr = {};
     server_addr.sin_family = AF_INET;
@@ -404,13 +446,26 @@ int main()
     uint32_t recv_mark[BUFFER_SIZE];
     memset(recv_mark, 0, sizeof(recv_mark));
 
+    int idle_timeouts = 0;
     while (is_receiving)
     {
         long long start_recv = PerfStats::now_us();
         char raw_buffer[sizeof(SlimDataPacket) + 64];
         int bytes_recv = recvfrom(sockfd, raw_buffer, sizeof(raw_buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
         if (bytes_recv <= 0)
+        {
+            if (start_received) {
+                idle_timeouts++;
+                if (idle_timeouts > 10) { // 10 * RECV_TIMEOUT = 10s roughly
+                    cerr << "\n[SERVER] Client inactivity timeout. Aborting transfer..." << endl;
+                    server_done = true;
+                    pthread_cond_signal(&queue_cond);
+                    break;
+                }
+            }
             continue;
+        }
+        idle_timeouts = 0; // reset on successful packet
 
         uint8_t p_type = (uint8_t)raw_buffer[0]; // Peek at type without deserializing full packet (type is at fixed offset)
 
@@ -430,8 +485,13 @@ int main()
             shared_filename = string(sp.filename);
             shared_file_size = sp.file_size;
             start_received = true;
+            
+            uint32_t saved_seq = load_checkpoint(shared_filename);
+            if (saved_seq > 1) {
+                ack_seq = saved_seq;
+            }
             pthread_mutex_unlock(&init_mutex);
-            cout << "[SERVER] Connection established!" << endl;
+            cout << "[SERVER] Connection established! Resume seq=" << ack_seq << endl;
             cout << "[SERVER] File: " << sp.filename
                  << " (" << sp.file_size << " bytes, "
                  << sp.total_chunks << " chunks)" << endl;
@@ -538,13 +598,12 @@ int main()
                     recv_mark[ack_seq % BUFFER_SIZE] = 0;
                     ack_seq++;
                 }
-                // If ack_seq jumped by more than 1, we consumed pre-buffered
-                // out-of-order packets — a previously signalled hole is now filled
                 gap_filled = (ack_seq > before + 1);
                 ack_counter++;
             }
 
-            bool send_sack = hole_detected || is_eof || gap_filled ||
+            bool duplicate = (pkt.seq_num < ack_seq);
+            bool send_sack = hole_detected || is_eof || gap_filled || duplicate ||
                              (ack_counter >= ACK_BATCH_SIZE);
 
             if (send_sack)
@@ -577,7 +636,7 @@ int main()
                 if (!hole_detected && !gap_filled)
                     ack_counter = 0;
             }
-            {
+            if (!duplicate) {
                 WorkItem item;
                 item.pkt = pkt;
                 item.compressed_len = compressed_len;

@@ -24,6 +24,7 @@
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
 #include "./headers/ringbuf.h"
+#include "./headers/concurrentqueue.h"
 #include <filesystem> // C++17
 #include <atomic>
 #include <vector>
@@ -31,14 +32,14 @@
 #include <sys/stat.h>
 
 #define BITMAP_ACK 512   // Bitmap ACKs cover 1024 packets beyond the cumulative ACK
-#define SOC_BUFFER 128  // Socket buffer size in MB (both send and receive)
-#define RECV_TIMEOUT 30 // 30-second recv timeout for ACKs
+#define SOC_BUFFER 16  // Socket buffer size in MB (both send and receive)
+#define RECV_TIMEOUT 100 // 30-second recv timeout for ACKs
 #define BITMAP_SIZE 512  // Bitmap size ACKs cover 1024 packets beyond the cumulative ACK set 20% of window size
 // Number of compressor threads -- tune to CPU core count
 #define COMPRESSOR_THREADS 6 // increase to 8 on 8+ core machines
 using namespace std;
-static const size_t RAW_Q_CAP = 4096;
-static const size_t READY_Q_CAP = 4096;
+static const size_t RAW_Q_CAP = 8192; //always 2*windowsize
+static const size_t READY_Q_CAP = 8192;
 
 struct ClientPerf
 {
@@ -123,6 +124,7 @@ uint64_t total_bytes_sent = 0;
 int total_inflights = 0;
 int retransmissions = 0;
 volatile bool transfer_complete = false;
+bool disable_compression = false;
 
 // ----------------------------------------------------------------------------
 // Helper Functions
@@ -200,16 +202,9 @@ struct ReorderBuf
     bool empty() const { return pending_count == 0; }
 };
 
-// ---- Pipeline queues -------------------------------------------------------
-// Raw queue: dispatcher -> compressor threads (SPMC: one dispatcher, N compressors)
-// Ready queue: compressor threads -> sender thread (MPSC: N compressors, one sender)
-
-// Raw queue uses mutex pop (multiple compressors pop, one dispatcher pushes)
-RingBuf<RawChunk, RAW_Q_CAP> raw_queue;
-pthread_mutex_t raw_pop_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Ready queue uses mutex push (multiple compressors push, one sender pops)
-MPRingBuf<ReadyPacket, READY_Q_CAP> ready_queue;
+// ---- Pipeline queues (Lock-Free MPMC) ---------------------------------------
+moodycamel::ConcurrentQueue<RawChunk> raw_queue;
+moodycamel::ConcurrentQueue<ReadyPacket> ready_queue;
 
 // Dispatcher state
 atomic<uint32_t> dispatch_offset{0};
@@ -234,24 +229,63 @@ uint32_t get_file_size(const char *filename)
 }
 
 // ============================================================================
-// STAGE 1: Dispatcher Thread (1 thread)
-// Reads file chunks sequentially, assigns monotonic seq_nums, pushes into
-// raw_queue. Applies back-pressure when ARQ window or raw_queue is saturated.
+// STAGE 1: Dispatcher Thread (1 thread)  — Memory-Mapped File (Zero-Copy)
+//
+// Uses Win32 CreateFileMapping + MapViewOfFile to map the entire file into
+// virtual address space. The dispatcher simply memcpy's from a pointer —
+// no kernel read() syscalls, no context switches per chunk. The OS's virtual
+// memory manager automatically prefetches sequential pages from the SSD.
 // ============================================================================
 
 void *dispatcher_thread(void *arg)
 {
-    ifstream infile(filename_str, ios::binary);
-    if (!infile.is_open())
+    // --- Open file with Win32 API for memory mapping --------------------------
+    HANDLE hFile = CreateFileA(
+        filename_str,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN,  // Hint to OS: we read sequentially → prefetch aggressively
+        NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE)
     {
-        cerr << " [DISPATCHER] Cannot open file: " << filename_str << endl;
-        cerr << "Reason: " << strerror(errno) << endl;
+        cerr << " [DISPATCHER] Cannot open file: " << filename_str
+             << " (Win32 error " << GetLastError() << ")" << endl;
+        dispatch_done.store(true, std::memory_order_release);
+        transfer_complete = true;
+        return nullptr;
+    }
+
+    // --- Create file mapping object ------------------------------------------
+    HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (hMapping == NULL)
+    {
+        cerr << " [DISPATCHER] CreateFileMapping failed (Win32 error "
+             << GetLastError() << ")" << endl;
+        CloseHandle(hFile);
+        dispatch_done.store(true, std::memory_order_release);
+        transfer_complete = true;
+        return nullptr;
+    }
+
+    // --- Map entire file into process address space --------------------------
+    const char *mapped_ptr = (const char *)MapViewOfFile(
+        hMapping, FILE_MAP_READ, 0, 0, 0);
+    if (mapped_ptr == NULL)
+    {
+        cerr << " [DISPATCHER] MapViewOfFile failed (Win32 error "
+             << GetLastError() << ")" << endl;
+        CloseHandle(hMapping);
+        CloseHandle(hFile);
         dispatch_done.store(true, std::memory_order_release);
         transfer_complete = true;
         return nullptr;
     }
 
     uint32_t local_offset = chunk_offset; // honours resume checkpoint
+    moodycamel::ProducerToken ptok(raw_queue);
 
     while (local_offset < (uint32_t)file_size && !transfer_complete)
     {
@@ -261,39 +295,33 @@ void *dispatcher_thread(void *arg)
             pthread_mutex_lock(&arq_mutex);
             int in_flight = arq.get_in_flight_count();
             pthread_mutex_unlock(&arq_mutex);
-            if (in_flight + (int)raw_queue.size() + (int)ready_queue.size() < SR_WINDOW_SIZE)
+            if (in_flight + (int)raw_queue.size_approx() + (int)ready_queue.size_approx() < SR_WINDOW_SIZE)
                 break;
             SwitchToThread();
         }
         if (transfer_complete)
             break;
 
-        // Back-pressure: raw_queue 75% full
-        while (raw_queue.size() > (RAW_Q_CAP * 3) / 4 && !transfer_complete)
+        // Back-pressure: raw_queue limit check
+        while (raw_queue.size_approx() > RAW_Q_CAP && !transfer_complete)
             SwitchToThread();
         if (transfer_complete)
             break;
 
-        // Read one chunk
+        // Zero-copy read: just memcpy from the mapped pointer
         RawChunk rc;
+        uint32_t remaining = (uint32_t)file_size - local_offset;
+        rc.bytes_read = (remaining < DATA_SIZE) ? remaining : DATA_SIZE;
+
         long long t_read = g_cperf.now_us();
-        infile.seekg(local_offset);
-        infile.read(rc.data, DATA_SIZE);
+        memcpy(rc.data, mapped_ptr + local_offset, rc.bytes_read);
         g_cperf.total_disk_read_us.fetch_add(g_cperf.now_us() - t_read, std::memory_order_relaxed);
-        rc.bytes_read = (size_t)infile.gcount();
-        if (rc.bytes_read == 0)
-            break;
 
         rc.offset = local_offset;
         rc.seq_num = dispatch_seq.fetch_add(1, std::memory_order_relaxed);
         rc.is_last = (local_offset + rc.bytes_read >= (uint32_t)file_size);
 
-        while (!raw_queue.push(rc))
-        {
-            if (transfer_complete)
-                break;
-            SwitchToThread();
-        }
+        raw_queue.enqueue(ptok, rc);
 
         local_offset += (uint32_t)rc.bytes_read;
         if (rc.is_last)
@@ -301,7 +329,11 @@ void *dispatcher_thread(void *arg)
     }
 
     dispatch_done.store(true, std::memory_order_release);
-    infile.close();
+
+    // --- Cleanup memory mapping ----------------------------------------------
+    UnmapViewOfFile(mapped_ptr);
+    CloseHandle(hMapping);
+    CloseHandle(hFile);
     return nullptr;
 }
 
@@ -313,25 +345,20 @@ void *dispatcher_thread(void *arg)
 
 void *compressor_thread(void *arg)
 {
+    moodycamel::ConsumerToken ctok_raw(raw_queue);
+    moodycamel::ProducerToken ptok_ready(ready_queue);
+
     while (!transfer_complete)
     {
         RawChunk rc;
-        bool got = false;
-
-        // Pop from raw_queue (mutex for SPMC safety)
-        pthread_mutex_lock(&raw_pop_mutex);
-        got = raw_queue.pop(rc);
-        pthread_mutex_unlock(&raw_pop_mutex);
+        bool got = raw_queue.try_dequeue(ctok_raw, rc);
 
         if (!got)
         {
             if (dispatch_done.load(std::memory_order_acquire))
             {
-                // Double-check: acquire fence guarantees visibility of all
-                // dispatcher pushes that happened before dispatch_done was set
-                pthread_mutex_lock(&raw_pop_mutex);
-                got = raw_queue.pop(rc);
-                pthread_mutex_unlock(&raw_pop_mutex);
+                // Final check
+                got = raw_queue.try_dequeue(ctok_raw, rc);
                 if (!got)
                     break; // truly done
             }
@@ -345,7 +372,7 @@ void *compressor_thread(void *arg)
         bool is_compressed = false;
 
         long long t_comp = g_cperf.now_us();
-        if (compress_data(rc.data, rc.bytes_read,
+        if (!disable_compression && compress_data(rc.data, rc.bytes_read,
                           compressed_data, compressed_len) == 0)
         {
             is_compressed = ((uint8_t)compressed_data[0] == 0x01);
@@ -395,15 +422,7 @@ void *compressor_thread(void *arg)
         rp.original_len = rc.bytes_read;
 
         // 5. Push to ready_queue
-        while (!ready_queue.push(rp))
-        {
-            if (transfer_complete)
-            {
-                compressors_done.fetch_add(1, std::memory_order_release);
-                return nullptr;
-            }
-            SwitchToThread();
-        }
+        ready_queue.enqueue(ptok_ready, rp);
     }
 
     compressors_done.fetch_add(1, std::memory_order_release);
@@ -426,6 +445,7 @@ void *sender_thread(void *arg)
 {
     // Heap-allocated reorder buffer -- ~6 MB, avoids Windows 1MB thread stack overflow crash
     auto pending = std::make_unique<ReorderBuf>();
+    moodycamel::ConsumerToken ctok(ready_queue);
 
     // Recover starting seq from ARQ send_base (honours resume checkpoint)
     uint32_t next_send_seq = arq.get_send_base();
@@ -434,7 +454,7 @@ void *sender_thread(void *arg)
     {
         // ---- 1. Drain ready_queue into circular reorder buffer (O(1) each) --
         ReadyPacket rp;
-        while (ready_queue.pop(rp))
+        while (ready_queue.try_dequeue(ctok, rp))
             pending->insert(rp.pkt.seq_num, rp);
 
         // ---- 2. Send packets in strict seq_num order ----------------------
@@ -518,7 +538,7 @@ void *sender_thread(void *arg)
         }
 
         // ---- 3. Termination check ----------------------------------------
-        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS && ready_queue.empty() && pending->empty())
+        if (compressors_done.load(std::memory_order_acquire) == COMPRESSOR_THREADS && ready_queue.size_approx() == 0 && pending->empty())
         {
             pthread_mutex_lock(&arq_mutex);
             int in_flight = arq.get_in_flight_count();
@@ -567,40 +587,71 @@ void *receiver_thread(void *arg)
                 arq.handle_cumulative_ack(cum);
                 uint32_t fast_retransmit_seqs[BITMAP_ACK];
                 int fast_retransmit_count = 0;
+                
+                // 2. Mark specific received packets
                 for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {
                     uint64_t chunk = ack_pkt.bitmap[chunk_idx];
                     if (chunk == 0xFFFFFFFFFFFFFFFFULL) {
-                        // Mark the whole 64-packet block as ACKed
                         for(int b=0; b<64; b++) 
                             arq.mark_packet_acked(cum + (chunk_idx * 64) + b);
                     }
                     else if (chunk != 0) {
-                        // Only loop if there's a mix of ACKs and Holes
                         for (int bit = 0; bit < 64; bit++) {
                             if (chunk & (1ULL << bit)) 
                                 arq.mark_packet_acked(cum + (chunk_idx * 64) + bit);
                         }
                     }
-                
-                
+                }
                 
                 acks_received++;
 
                 if (arq.get_in_flight_count() > 1000)
                     total_inflights++;
 
-                uint64_t holes = ~chunk; // Flip bits: 0s (holes) become 1s
-                unsigned long bit_pos;
-                // _BitScanForward64 finds the first '1' (our hole) in 1 clock cycle
-                while (_BitScanForward64(&bit_pos, holes)) {
-                    fast_retransmit_seqs[fast_retransmit_count++] = cum + (chunk_idx * 64) + bit_pos;
-                    holes &= ~(1ULL << bit_pos); // Clear this hole to find the next one
-                    if (holes == 0) break;
+                // 3. Find highest SACK bit across all chunks
+                int max_sack_idx = -1;
+                for (int chunk_idx = 3; chunk_idx >= 0; chunk_idx--) {
+                    if (ack_pkt.bitmap[chunk_idx] != 0) {
+                        unsigned long highest_bit = 0;
+                        _BitScanReverse64(&highest_bit, ack_pkt.bitmap[chunk_idx]);
+                        max_sack_idx = (chunk_idx * 64) + highest_bit;
+                        break;
+                    }
                 }
-            }
+
+                // 4. Identify holes and schedule fast retransmit
+                if (max_sack_idx >= 0) {
+                    for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {
+                        uint64_t chunk = ack_pkt.bitmap[chunk_idx];
+                        uint64_t holes = ~chunk; // Flip bits: 0s (holes) become 1s
+                        
+                        int base_offset = chunk_idx * 64;
+                        if (base_offset > max_sack_idx) {
+                            holes = 0; // Everything above max_sack_idx is unsent/unreceived, not a hole
+                        } else if (base_offset + 63 > max_sack_idx) {
+                            int valid_bits = max_sack_idx - base_offset;
+                            uint64_t mask = ~0ULL;
+                            if (valid_bits < 63) {
+                                mask = (1ULL << (valid_bits + 1)) - 1;
+                            }
+                            holes &= mask;
+                        }
+
+                        if (holes != 0) {
+                            unsigned long bit_pos;
+                            // _BitScanForward64 finds the first '1' (our hole) in 1 clock cycle
+                            while (_BitScanForward64(&bit_pos, holes)) {
+                                fast_retransmit_seqs[fast_retransmit_count++] = cum + base_offset + bit_pos;
+                                holes &= ~(1ULL << bit_pos); // Clear this hole to find the next one
+                                if (holes == 0) break;
+                            }
+                        }
+                    }
+                }
+                
                 arq.advance_window();
                 pthread_mutex_unlock(&arq_mutex);
-                // fast retransmission checking
+
                 long long t_scan_done = ClientPerf::now_us();
 
                 // 5. Retransmit OUTSIDE the lock to keep the Sender thread moving
@@ -624,6 +675,7 @@ void *receiver_thread(void *arg)
                 cerr << "[CLIENT] Corrupt ACK dropped! Seq=" << ack_pkt.ack_num << endl;
             }
         }
+        
     }
     return nullptr;
 }
@@ -733,6 +785,23 @@ int main(int argc, char *argv[])
     // Now 'filename' is just "tata-motor-IAR-2024-25.pdf"
     file_size = get_file_size(filename_str);
 
+    // Auto-detect incompressible files
+    string lower_filename = filename;
+    for (char &c : lower_filename) c = tolower(c);
+    if (lower_filename.find(".mp4") != string::npos ||
+        lower_filename.find(".mkv") != string::npos ||
+        lower_filename.find(".zip") != string::npos ||
+        lower_filename.find(".rar") != string::npos ||
+        lower_filename.find(".7z") != string::npos ||
+        lower_filename.find(".gz") != string::npos ||
+        lower_filename.find(".jpg") != string::npos ||
+        lower_filename.find(".jpeg") != string::npos ||
+        lower_filename.find(".png") != string::npos)
+    {
+        disable_compression = true;
+        cout << " Auto-detected incompressible file format. Compression is DISABLED." << endl;
+    }
+
     if (file_size < 0)
     {
         cerr << " Cannot open file: " << filename_str << endl;
@@ -751,13 +820,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = RECV_TIMEOUT * 1000;           // changed to 200ms to better accommodate SR's per-packet timeouts and avoid excessive looping on recvfrom
+    DWORD recv_timeout_ms = RECV_TIMEOUT; // 200ms timeout
     int buffer_size = SOC_BUFFER * 1024 * 1024; // 64 MB
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (char *)&buffer_size, sizeof(buffer_size));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, (char *)&buffer_size, sizeof(buffer_size));
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&recv_timeout_ms, sizeof(recv_timeout_ms));
 
     addr_len = sizeof(server_addr);
     memset(&server_addr, 0, sizeof(server_addr));
