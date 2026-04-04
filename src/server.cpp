@@ -31,12 +31,12 @@ using namespace std;
 // =============================================================================
 // Tuning Constants
 // =============================================================================
-#define BUFFER_SIZE 4096   // Must match SR_WINDOW_SIZE (client's sliding window)
-#define ACK_BATCH_SIZE 64  // Send SACK every N in-order packets
-#define RECV_TIMEOUT 100   // 100ms — responsive to client (was 1000ms)
-#define SOC_BUFFER 64      // 64MB socket buffers (was 32MB)
-#define DECOMPRESSOR_THREADS 4
-#define IDLE_TIMEOUT_COUNT 50 // 50 × 100ms = 5s of true inactivity (was 10s)
+#define BUFFER_SIZE 4096 // Must match SR_WINDOW_SIZE (client's sliding window)
+// #define ACK_BATCH_SIZE 32 // Send SACK every N in-order packets
+#define RECV_TIMEOUT 100 // 100ms — responsive to client (was 1000ms)
+#define SOC_BUFFER 64    // 64MB socket buffers (was 32MB)
+#define DECOMPRESSOR_THREADS 2
+#define IDLE_TIMEOUT_COUNT 100 // 100 × 100ms = 10s of true inactivity (was 10s)
 
 // =============================================================================
 // Work Queue Item — CRC/HMAC-verified raw packet waiting for decompression
@@ -110,8 +110,8 @@ uint32_t shared_file_size = 0;
 std::atomic<bool> start_received{false};
 
 void handle_sigint(int sig) {
-  cout << "\n[SERVER] Caught signal " << sig
-       << ", shutting down gracefully..." << endl;
+  cout << "\n[SERVER] Caught signal " << sig << ", shutting down gracefully..."
+       << endl;
   server_done.store(true, std::memory_order_relaxed);
 }
 
@@ -202,15 +202,24 @@ void *decompressor_thread(void *arg) {
     size_t decomp_len = sizeof(decompressed_buffer);
 
     long long decomp_start = PerfStats::now_us();
-    int ret = decompress_data(decrypted_data, item.compressed_len,
-                              decompressed_buffer, decomp_len);
-    g_perf.total_decomp_time_us.fetch_add(PerfStats::now_us() - decomp_start,
-                                          std::memory_order_relaxed);
-    if (ret != 0) {
-      cerr << "[DECOMP] Decomp failed seq=" << pkt.seq_num << " err=" << ret
-           << endl;
-      continue;
+    if (pkt.type & 0x80) {
+      int ret = decompress_data(decrypted_data, item.compressed_len,
+                                decompressed_buffer, decomp_len);
+      g_perf.total_decomp_time_us.fetch_add(PerfStats::now_us() - decomp_start,
+                                            std::memory_order_relaxed);
+      if (ret != 0) {
+        cerr << "[DECOMP] Decomp failed seq=" << pkt.seq_num << " err=" << ret
+             << endl;
+        continue;
+      }
+    } else {
+      // Uncompressed
+      memcpy(decompressed_buffer, decrypted_data, item.compressed_len);
+      decomp_len = item.compressed_len;
     }
+
+    // Clear the compression flag for the writer (so EOF check works)
+    pkt.type &= ~0x80;
 
     // ---- 3. STORE IN POOL (atomic handoff to writer) -----------------------
     int idx = pkt.seq_num % BUFFER_SIZE;
@@ -484,17 +493,22 @@ int main() {
         WSARecvFrom(sockfd, &wsabuf_recv, 1, &bytes_recv_dword, &flags,
                     (struct sockaddr *)&client_addr, &from_len, NULL, NULL);
 
-    int bytes_recv = (result == 0) ? (int)bytes_recv_dword : -1;
+    int bytes_recv = (result == 0) ? (int)bytes_recv_dword : result;
 
     if (bytes_recv <= 0) {
       if (start_received.load(std::memory_order_relaxed)) {
-        idle_timeouts++;
-        if (idle_timeouts > IDLE_TIMEOUT_COUNT) {
-          cerr << "\n[SERVER] Client inactivity timeout ("
-               << (IDLE_TIMEOUT_COUNT * RECV_TIMEOUT / 1000)
-               << "s). Aborting transfer..." << endl;
-          server_done.store(true, std::memory_order_relaxed);
-          break;
+        int err = WSAGetLastError();
+        if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+          idle_timeouts++;
+          if (idle_timeouts > IDLE_TIMEOUT_COUNT) {
+            cerr << "\n[SERVER] Client inactivity timeout ("
+                 << (IDLE_TIMEOUT_COUNT * RECV_TIMEOUT / 1000)
+                 << "s). Aborting transfer..." << endl;
+            server_done.store(true, std::memory_order_relaxed);
+            break;
+          }
+        } else if (err != WSAECONNRESET) {
+          cerr << "[SERVER] WSARecvFrom error: " << err << endl;
         }
       }
       continue;
@@ -530,8 +544,7 @@ int main() {
       // Set start_received AFTER init data is written (release semantics)
       start_received.store(true, std::memory_order_release);
 
-      cout << "[SERVER] Connection established! Resume seq=" << ack_seq
-           << endl;
+      cout << "[SERVER] Connection established! Resume seq=" << ack_seq << endl;
       cout << "[SERVER] File: " << sp.filename << " (" << sp.file_size
            << " bytes, " << sp.total_chunks << " chunks)" << endl;
 
@@ -589,26 +602,43 @@ int main() {
       // ── CRC Check ─────────────────────────────────────────────────────
       uint32_t received_crc = pkt.crc32;
       pkt.crc32 = 0;
-      uint32_t computed = calculate_crc32(
-          reinterpret_cast<const unsigned char *>(&pkt), sizeof(SlimDataPacket));
+      uint32_t computed =
+          calculate_crc32(reinterpret_cast<const unsigned char *>(&pkt),
+                          sizeof(SlimDataPacket));
       pkt.crc32 = received_crc;
       memcpy(pkt.hmac, received_hmac, 16);
 
       if (computed != received_crc) {
-        cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num << " expected=0x"
-             << hex << received_crc << " got=0x" << computed << dec << endl;
+        cerr << "[SERVER] CRC FAIL seq=" << pkt.seq_num << " expected=0x" << hex
+             << received_crc << " got=0x" << computed << dec << endl;
         g_perf.crc_fails.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
 
       // ── Hybrid SACK: track, decide, and send ──────────────────────────
-      if (pkt.seq_num >= ack_seq && pkt.seq_num < ack_seq + BUFFER_SIZE)
+      bool duplicate = false;
+      if (pkt.seq_num < ack_seq) {
+        duplicate = true;
+      } else if (pkt.seq_num >= ack_seq &&
+                 pkt.seq_num < ack_seq + BUFFER_SIZE) {
+        if (recv_mark[pkt.seq_num % BUFFER_SIZE] == pkt.seq_num) {
+          duplicate = true;
+        }
         recv_mark[pkt.seq_num % BUFFER_SIZE] = pkt.seq_num;
+      }
+
+      if (duplicate) {
+        // Silently ignore strictly-in-window true duplicates as network echoes
+        // are common, but if it's wildly out of order this helps debug:
+        if (pkt.seq_num < ack_seq && (ack_seq - pkt.seq_num) > 1000) {
+          cerr << " [DEBUG] Wildly late duplicate received: seq=" << pkt.seq_num
+               << " (ack_seq=" << ack_seq << ")" << endl;
+        }
+      }
 
       bool hole_detected = (pkt.seq_num > ack_seq);
       bool is_eof = (pkt.type == 3);
       bool gap_filled = false;
-      bool duplicate = (pkt.seq_num < ack_seq);
 
       // Advance cumulative watermark
       if (pkt.seq_num == ack_seq) {
@@ -623,8 +653,7 @@ int main() {
 
       // Rate-limit hole SACKs (1 per 8 OOO events)
       bool send_sack = (hole_detected && (++hole_sack_counter % 8 == 0)) ||
-                       is_eof || gap_filled || duplicate ||
-                       (ack_counter >= ACK_BATCH_SIZE);
+                       is_eof || gap_filled || duplicate;
 
       if (send_sack) {
         ACKPacket sack;
@@ -669,6 +698,24 @@ int main() {
       is_receiving = false;
       break;
     }
+  }
+
+  // If server ended prematurely (timeout, SIGINT, etc.) and handshake was done,
+  // send ABORT ACK
+  if (server_done.load(std::memory_order_relaxed) &&
+      start_received.load(std::memory_order_relaxed)) {
+    ACKPacket abort_ack;
+    memset(&abort_ack, 0, sizeof(abort_ack));
+    abort_ack.type = 4; // ABORT signal
+    abort_ack.ack_num = 0;
+    // We can use calculate_crc32 directly exactly as done earlier
+    abort_ack.crc32 =
+        calculate_crc32(reinterpret_cast<const unsigned char *>(&abort_ack),
+                        sizeof(ACKPacket) - sizeof(uint32_t));
+    serialize_ack_packet(&abort_ack);
+    sendto(sockfd, (const char *)&abort_ack, sizeof(abort_ack), 0,
+           (struct sockaddr *)&client_addr, addr_len);
+    cout << "\n[SERVER] Sent ABORT signal to client." << endl;
   }
 
   // ── Signal decompressors that no more packets are coming ────────────────
