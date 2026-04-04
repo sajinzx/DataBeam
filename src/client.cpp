@@ -128,7 +128,7 @@ socklen_t addr_len;
 string filename;
 const char *filename_str;
 uint32_t file_size;
-uint32_t chunk_offset = 0;
+uint64_t chunk_offset = 0;
 int total_chunks;
 int chunks_sent = 0;
 int acks_received = 0;
@@ -319,7 +319,7 @@ void *dispatcher_thread(void *arg) {
     return nullptr;
   }
 
-  uint32_t local_offset = chunk_offset; // honours resume checkpoint
+  uint64_t local_offset = chunk_offset; // honours resume checkpoint
   moodycamel::ProducerToken ptok(raw_queue);
 
   while (local_offset < (uint32_t)file_size && !transfer_complete) {
@@ -559,7 +559,7 @@ void *sender_thread(void *arg) {
       arq.increment_seq_num();
       chunks_sent++;
       total_bytes_sent += cur.original_len;
-      chunk_offset += (uint32_t)cur.original_len;
+      chunk_offset += (uint64_t)cur.original_len;
       pthread_mutex_unlock(&arq_mutex);
 
       g_cperf.packets_sent.fetch_add(1, std::memory_order_relaxed);
@@ -600,9 +600,12 @@ void *receiver_thread(void *arg) {
     if (bytes_recv <= 0) {
       int err = WSAGetLastError();
       if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) {
+        // If EOF was already sent (transfer_complete set by sender),
+        // the server may have shut down — exit cleanly, not as an error.
+        if (transfer_complete)
+          break;
         idle_timeouts++;
-        if (idle_timeouts >
-            DataBeam::IDLE_TIMEOUT_COUNT) { // 100 * 100ms = 10s inactivity
+        if (idle_timeouts > DataBeam::IDLE_TIMEOUT_COUNT) {
           cerr << "\n[CLIENT] Server inactivity timeout (10s). Aborting "
                   "transfer..."
                << endl;
@@ -651,6 +654,7 @@ void *receiver_thread(void *arg) {
         pthread_mutex_lock(&arq_mutex);
         long long t_locked = ClientPerf::now_us();
         uint32_t cum = ack_pkt.ack_num;
+        arq.handle_cumulative_ack(cum);
 
         // Heap-allocate to avoid stack overflow risk (BITMAP_ACK=512 * 4B = 2KB
         // on receiver stack)
@@ -767,30 +771,31 @@ void *timeout_thread(void *arg) {
     pthread_mutex_unlock(&arq_mutex);
 
     if (timed_out_seq != 0) {
-      cout << "[TIMEOUT] Detected timeout for seq=" << timed_out_seq << endl;
       SlimDataPacket retransmit_pkt;
-      bool ready = false;
+      int ready = 0;
 
       pthread_mutex_lock(&arq_mutex);
-      // Use dynamic max_retransmits instead of the old hardcoded 200
       int dyn_max = g_adapt.get_max_retransmits();
       arq.set_max_retransmits(dyn_max);
       ready = arq.prepare_retransmit(timed_out_seq, retransmit_pkt);
-      if (ready) {
+      if (ready == 1) {
         retransmissions++;
         g_adapt.on_timeout(); // double the RTO
-        // Update ARQ's internal RTO so check_for_timeout uses new value
         arq.set_rto(g_adapt.rto_ms.load());
       }
       pthread_mutex_unlock(&arq_mutex);
 
-      if (ready) {
+      if (ready == 1) {
+        // Only print when we actually retransmit — avoids spurious noise
+        // when packet was already ACKed between check and prepare
+        cout << "[TIMEOUT] Retransmitting seq=" << timed_out_seq
+             << " (rto=" << g_adapt.rto_ms.load() << "ms)" << endl;
         SlimDataPacket pkt_send = retransmit_pkt;
         serialize_slim_packet(&pkt_send);
         sendto(sockfd, (const char *)&pkt_send, sizeof(pkt_send), 0,
                (struct sockaddr *)&server_addr, addr_len);
-      } else {
-        cerr << " [TIMEOUT] Max retries exceeded for seq=" << timed_out_seq
+      } else if (ready == -1) {
+        cerr << "[TIMEOUT] Max retries exceeded for seq=" << timed_out_seq
              << ". Aborting." << endl;
         ACKPacket abort_ack;
         memset(&abort_ack, 0, sizeof(abort_ack));
@@ -802,6 +807,7 @@ void *timeout_thread(void *arg) {
                (struct sockaddr *)&server_addr, addr_len);
         transfer_complete = true;
       }
+      // ready == 0: packet was already ACKed concurrently — nothing to do
     }
 
     // Pro-Tip: 5ms is okay for local testing, but for 95 Mbps,
@@ -932,7 +938,7 @@ int main(int argc, char *argv[]) {
 
   // Check for resume checkpoint
   uint32_t starting_seq = 1;
-  uint32_t starting_offset = 0;
+  uint64_t starting_offset = 0;
   ifstream in("resume.json");
 
   if (in.is_open()) {
@@ -957,7 +963,7 @@ int main(int argc, char *argv[]) {
             (uint32_t)stoul(content.substr(s_start, s_end - s_start));
         starting_seq = expected_seq;
         starting_offset =
-            (uint32_t)(expected_seq - 1) * DataBeam::PACKET_DATA_SIZE;
+            (uint64_t)(expected_seq - 1) * (uint64_t)DataBeam::PACKET_DATA_SIZE;
         if (starting_seq > total_chunks) {
           cout << " File already 100% complete according to checkpoint. "
                   "Skipping transfer."

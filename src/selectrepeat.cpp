@@ -4,7 +4,6 @@
 #include <iomanip>
 #include <iostream>
 
-
 using namespace std;
 
 // Constructor: Initialize SR ARQ state
@@ -186,83 +185,41 @@ uint32_t SelectiveRepeatARQ::check_for_timeout() {
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
 
-  for (int count = 0; count < DataBeam::SR_WINDOW_SIZE; count++) {
+  // Only scan actually in-flight count, not the full window
+  int in_flight = in_flight_count.load(std::memory_order_relaxed);
+  if (in_flight == 0) {
+    pthread_mutex_unlock(&window_mutex);
+    return 0; // fast exit — nothing to check
+  }
+
+  int checked = 0;
+  for (int count = 0; count < DataBeam::SR_WINDOW_SIZE && checked < in_flight;
+       count++) {
     uint32_t seq_to_check = send_base + count;
     uint32_t idx = seq_to_check & (DataBeam::SR_WINDOW_SIZE - 1);
-
-    // if (seq_to_check == send_base)
-    // {
-    //     cout << "[CHECK] base=" << send_base << " occ=" << slot_occupied[idx]
-    //     << " acked=" << window_buffer[idx].is_acked << " seq=" <<
-    //     window_buffer[idx].pkt.seq_num << endl;
-    // }
 
     if (!slot_occupied[idx])
       continue;
     if (window_buffer[idx].pkt.seq_num != seq_to_check)
       continue;
 
-    uint32_t seq_num = window_buffer[idx].pkt.seq_num;
+    checked++;
     WindowPacket &wp = window_buffer[idx];
-
-    // Skip already-acked packets
     if (wp.is_acked)
       continue;
 
-    // Calculate elapsed time in milliseconds
     long elapsed_ms =
         (now.tv_sec - wp.send_time.tv_sec) * DataBeam::MS_PER_SEC +
         (now.tv_nsec - wp.send_time.tv_nsec) / DataBeam::NS_PER_MS;
 
-    // if (seq_num == send_base)
-    // {
-    //     cout << "[ARQ DEBUG] base=" << send_base << " acked=" << wp.is_acked
-    //         cerr << "[ARQ] in_flight COUNT MISMATCH! actual=" << count << "
-    //         atomic=" << in_flight_count.load() << std::endl;
-    // }
-
-    // Check if timeout exceeded — use the DYNAMIC rto_ms member, not the
-    // compile-time macro
     if (elapsed_ms >= (long)rto_ms) {
       pthread_mutex_unlock(&window_mutex);
-      return seq_num; // Found a timed-out packet
+      return wp.pkt.seq_num;
     }
   }
 
   pthread_mutex_unlock(&window_mutex);
-  return 0; // No timeout
-}
-
-// Prepare packet for retransmission (reset timer, increment counter)
-bool SelectiveRepeatARQ::prepare_retransmit(uint32_t seq_num,
-                                            SlimDataPacket &pkt_out) {
-  pthread_mutex_lock(&window_mutex);
-
-  uint32_t idx = seq_num & (DataBeam::SR_WINDOW_SIZE - 1);
-  if (!slot_occupied[idx] || window_buffer[idx].pkt.seq_num != seq_num) {
-    pthread_mutex_unlock(&window_mutex);
-    return false;
-  }
-
-  WindowPacket &wp = window_buffer[idx];
-
-  // Check maximum retransmit limit (dynamically set by AdaptiveParams)
-  if (wp.retransmit_count >= max_retransmits) {
-    cout << "  Max retransmits (" << max_retransmits
-         << ") reached for seq=" << seq_num << endl;
-    pthread_mutex_unlock(&window_mutex);
-    return false;
-  }
-
-  // Update retransmission state
-  wp.retransmit_count++;
-  clock_gettime(CLOCK_MONOTONIC, &wp.send_time); // Reset timer
-
-  // Copy packet for sending
-  pkt_out = wp.pkt;
-
-  pthread_mutex_unlock(&window_mutex);
-  return true;
+  return 0;
 }
 
 // Fast retransmit: cooldown guard so SACK floods don't burn the retransmit
@@ -305,6 +262,38 @@ bool SelectiveRepeatARQ::try_fast_retransmit(uint32_t seq_num,
 
   pthread_mutex_unlock(&window_mutex);
   return true;
+}
+int SelectiveRepeatARQ::prepare_retransmit(uint32_t seq_num,
+                                            SlimDataPacket &pkt_out) {
+  pthread_mutex_lock(&window_mutex);
+
+  uint32_t idx = seq_num & (DataBeam::SR_WINDOW_SIZE - 1);
+  if (!slot_occupied[idx] || window_buffer[idx].pkt.seq_num != seq_num) {
+    pthread_mutex_unlock(&window_mutex);
+    return 0;
+  }
+
+  WindowPacket &wp = window_buffer[idx];
+  if (wp.is_acked) {
+    pthread_mutex_unlock(&window_mutex);
+    return 0;
+  }
+
+  wp.retransmit_count++;
+  if (wp.retransmit_count > max_retransmits) {
+    pthread_mutex_unlock(&window_mutex);
+    return -1;
+  }
+
+  timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  wp.send_time = now;
+  wp.last_retransmit_time = now;
+  
+  pkt_out = wp.pkt;
+
+  pthread_mutex_unlock(&window_mutex);
+  return 1;
 }
 
 bool SelectiveRepeatARQ::get_packet_for_retransmit(uint32_t seq_num,
@@ -351,6 +340,45 @@ void SelectiveRepeatARQ::print_window_state() const {
     }
   }
   cout << endl;
+
+  pthread_mutex_unlock(&window_mutex);
+}
+// Mark a range of packets acked in one lock acquisition
+void SelectiveRepeatARQ::mark_range_acked(uint32_t base,
+                                          const uint64_t *bitmap_chunks,
+                                          int num_chunks) {
+  pthread_mutex_lock(&window_mutex);
+
+  for (int ci = 0; ci < num_chunks; ci++) {
+    uint64_t chunk = bitmap_chunks[ci];
+    if (chunk == 0)
+      continue;
+
+    for (int bit = 0; bit < 64; bit++) {
+      if (!(chunk & (1ULL << bit)))
+        continue;
+
+      uint32_t seq = base + (ci * 64) + bit;
+      uint32_t idx = seq & (DataBeam::SR_WINDOW_SIZE - 1);
+
+      if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num == seq)
+        window_buffer[idx].is_acked = true;
+    }
+  }
+
+  // One advance_window pass covers everything
+  while (true) {
+    uint32_t idx = send_base & (DataBeam::SR_WINDOW_SIZE - 1);
+    if (slot_occupied[idx] && window_buffer[idx].pkt.seq_num == send_base &&
+        window_buffer[idx].is_acked) {
+      slot_occupied[idx] = false;
+      in_flight_count.fetch_sub(1, std::memory_order_relaxed);
+      send_base++;
+      ack_bitmap >>= 1;
+      ack_bitmap[DataBeam::SR_WINDOW_SIZE - 1] = 0;
+    } else
+      break;
+  }
 
   pthread_mutex_unlock(&window_mutex);
 }

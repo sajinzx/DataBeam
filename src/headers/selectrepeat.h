@@ -5,8 +5,8 @@
 #ifndef SELECTREPEAT_H
 #define SELECTREPEAT_H
 
-#include "packet.h"
 #include "constants.h"
+#include "packet.h"
 #include <atomic>
 #include <bitset>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include <ctime>
 #include <map>
 #include <pthread.h>
+
 // Server sends SACK every N in-order packets
 
 // Structure to wrap Packet with timeout tracking for SR ARQ
@@ -37,16 +38,17 @@ struct WindowPacket {
 class SelectiveRepeatARQ {
 private:
   // Window variables
-  uint32_t send_base;                     // Oldest unacked packet sequence
-  uint32_t next_seq_num;                  // Next packet to send
-  std::bitset<DataBeam::SR_WINDOW_SIZE> ack_bitmap; // ACK status: bit i = acked(base+i)?
+  uint32_t send_base;    // Oldest unacked packet sequence
+  uint32_t next_seq_num; // Next packet to send
+  std::bitset<DataBeam::SR_WINDOW_SIZE>
+      ack_bitmap; // ACK status: bit i = acked(base+i)?
 
   // Packet buffer: Pre-allocated circular array (O(1) access, zero heap churn)
   // Size is SR_WINDOW_SIZE (4096). Indexed by (seq_num & (SR_WINDOW_SIZE - 1)).
   WindowPacket window_buffer[DataBeam::SR_WINDOW_SIZE];
-  bool slot_occupied[DataBeam::SR_WINDOW_SIZE]; // Tracks if a slot contains an unacked
-                                      // packet
-  std::atomic<int> in_flight_count;   // O(1) tracking of buffered packets
+  bool slot_occupied[DataBeam::SR_WINDOW_SIZE]; // Tracks if a slot contains an
+                                                // unacked packet
+  std::atomic<int> in_flight_count; // O(1) tracking of buffered packets
 
   // Thread synchronization
   mutable pthread_mutex_t window_mutex; // Protects window state
@@ -104,8 +106,8 @@ public:
   // Prepare packet for retransmission (updates send_time and retransmit_count)
   // Used by timeout_thread — increments retransmit_count, returns false when
   // budget exhausted.
-  bool prepare_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
-  bool prepare_retransmit(uint32_t seq_num, StartPacket &pkt_out);
+  int prepare_retransmit(uint32_t seq_num, SlimDataPacket &pkt_out);
+  int prepare_retransmit(uint32_t seq_num, StartPacket &pkt_out);
 
   // Fast retransmit (from receiver_thread): has cooldown guard, does NOT
   // increment retransmit_count. Returns false if the packet was retransmitted
@@ -117,7 +119,8 @@ public:
   uint8_t get_acked_count() const { return ack_bitmap.count(); }
   bool is_window_empty() const { return get_in_flight_count() == 0; }
   bool is_packet_acked(uint32_t seq_num) const;
-
+  void mark_range_acked(uint32_t base, const uint64_t *bitmap_chunks,
+                        int num_chunks);
   // Print current window state (for debugging)
   void print_window_state() const;
 };

@@ -20,9 +20,9 @@
 
 #include "./headers/compress.h"
 #include "./headers/concurrentqueue.h"
+#include "./headers/constants.h"
 #include "./headers/crchw.h"
 #include "./headers/crypto.h"
-#include "./headers/constants.h"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -200,7 +200,7 @@ void *decompressor_thread(void *arg) {
     const uint8_t *SHARED_SECRET_KEY = DataBeam::SHARED_SECRET_KEY;
     if (!verify_hmac((const uint8_t *)&pkt, sizeof(pkt), SHARED_SECRET_KEY,
                      received_hmac)) {
-      cerr << "[DECOMP] HMAC FAIL seq=" << pkt.seq_num << endl;
+      cerr << "[DECOMP] HMAC FAIL seq=" << ntohl(pkt.seq_num) << endl;
       continue;
     }
 
@@ -209,9 +209,8 @@ void *decompressor_thread(void *arg) {
 
     uint32_t received_crc = pkt.crc32;
     pkt.crc32 = 0;
-    uint32_t computed =
-        calculate_crc32(reinterpret_cast<const unsigned char *>(&pkt),
-                        sizeof(SlimDataPacket));
+    uint32_t computed = calculate_crc32(
+        reinterpret_cast<const unsigned char *>(&pkt), sizeof(SlimDataPacket));
     pkt.crc32 = received_crc;
     memcpy(pkt.hmac, received_hmac, 16);
 
@@ -250,7 +249,7 @@ void *decompressor_thread(void *arg) {
     pkt.flags &= ~0x01;
 
     // ---- 3. STORE IN POOL (atomic handoff to writer) -----------------------
-    uint32_t pool_idx = pkt.seq_num % DataBeam::SERVER_RECV_BUFFER_SIZE;
+    uint32_t pool_idx = pkt.seq_num & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1);
     PoolSlot &slot = g_pool[pool_idx];
 
     while (slot.ready.load(std::memory_order_acquire) &&
@@ -402,11 +401,30 @@ void *writer_thread(void *arg) {
     if (hit_eof) {
       flush_bunch();
       transfer_success = true;
-      if (remove("resume.json") == 0) {
-        cout << "[WRITER] Checkpoint deleted successfully." << endl;
-      } else {
-        // If it fails, try one more time now that file is closed
-        remove("resume.json");
+      // Robust checkpoint cleanup — retry with delays for Windows file locking
+      bool deleted = false;
+      for (int attempt = 0; attempt < 5 && !deleted; attempt++) {
+        if (remove("resume.json") == 0) {
+          deleted = true;
+          cout << "[WRITER] Checkpoint deleted successfully." << endl;
+        } else {
+          Sleep(100); // Wait for file lock release (e.g., VS Code)
+        }
+      }
+      if (!deleted) {
+        // Fallback: truncate the file so stale data doesn't cause wrong resume
+        ofstream trunc("resume.json", ios::trunc);
+        if (trunc.is_open()) {
+          trunc << "{}\n";
+          trunc.close();
+          cout << "[WRITER] Checkpoint truncated (could not delete — file may "
+                  "be open in editor)."
+               << endl;
+        } else {
+          cerr << "[WRITER] WARNING: Could not delete or truncate resume.json! "
+                  "Close it in your editor."
+               << endl;
+        }
       }
       cout << "[WRITER] Transfer complete: " << out_filepath << endl;
       server_done.store(true, std::memory_order_relaxed);
@@ -481,8 +499,8 @@ int main() {
     return 1;
   }
   cout << " Listening on port " << DataBeam::DEFAULT_PORT << "..." << endl;
-  cout << " Pipeline: " << DataBeam::SERVER_DECOMPRESSOR_THREADS << " decompressors, 1 writer"
-       << endl;
+  cout << " Pipeline: " << DataBeam::SERVER_DECOMPRESSOR_THREADS
+       << " decompressors, 1 writer" << endl;
   cout << " Socket buffers: " << DataBeam::SERVER_SOCKET_BUFFER_MB
        << "MB, Recv timeout: " << DataBeam::RECV_TIMEOUT_MS << "ms" << endl;
 
@@ -533,7 +551,8 @@ int main() {
           idle_timeouts++;
           if (idle_timeouts > DataBeam::IDLE_TIMEOUT_COUNT) {
             cerr << "\n[SERVER] Client inactivity timeout ("
-                 << (DataBeam::IDLE_TIMEOUT_COUNT * DataBeam::RECV_TIMEOUT_MS / DataBeam::MS_PER_SEC)
+                 << (DataBeam::IDLE_TIMEOUT_COUNT * DataBeam::RECV_TIMEOUT_MS /
+                     DataBeam::MS_PER_SEC)
                  << "s). Aborting transfer..." << endl;
             server_done.store(true, std::memory_order_relaxed);
             break;
@@ -602,8 +621,10 @@ int main() {
       if (!start_received.load(std::memory_order_relaxed))
         continue;
 
-      if (bytes_recv < (int)(sizeof(SlimDataPacket) - DataBeam::PACKET_DATA_SIZE)) {
-        cerr << "[NET] Dropped small packet: " << bytes_recv << " bytes" << endl;
+      if (bytes_recv <
+          (int)(sizeof(SlimDataPacket) - DataBeam::PACKET_DATA_SIZE)) {
+        cerr << "[NET] Dropped small packet: " << bytes_recv << " bytes"
+             << endl;
         continue;
       }
 
@@ -612,9 +633,10 @@ int main() {
       SlimDataPacket pkt;
       memcpy(&pkt, raw_buffer, sizeof(pkt));
 
-      // Extract seq_num/type manually from big-endian wire format for SACK processing.
-      // WE DO NOT modify pkt itself here because HMAC verification in the 
-      // decompressor thread needs the packet to be in its original wire format.
+      // Extract seq_num/type manually from big-endian wire format for SACK
+      // processing. WE DO NOT modify pkt itself here because HMAC verification
+      // in the decompressor thread needs the packet to be in its original wire
+      // format.
       uint32_t net_seq;
       memcpy(&net_seq, raw_buffer + 1, 4);
       uint32_t peek_seq = ntohl(net_seq);
@@ -625,11 +647,14 @@ int main() {
       if (peek_seq < g_ack_seq.load()) {
         duplicate = true;
       } else if (peek_seq >= g_ack_seq.load() &&
-                 peek_seq < g_ack_seq.load() + DataBeam::SERVER_RECV_BUFFER_SIZE) {
-        if (recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == peek_seq) {
+                 peek_seq <
+                     g_ack_seq.load() + DataBeam::SERVER_RECV_BUFFER_SIZE) {
+        if (recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] ==
+            peek_seq) {
           duplicate = true;
         }
-        recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = peek_seq;
+        recv_mark[peek_seq & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] =
+            peek_seq;
       }
 
       bool hole_detected = (peek_seq > g_ack_seq.load());
@@ -639,10 +664,12 @@ int main() {
       // Advance cumulative watermark
       if (peek_seq == g_ack_seq.load()) {
         uint32_t before = g_ack_seq.load();
-        while (recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] == g_ack_seq.load()) {
+        while (recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE -
+                                             1)] == g_ack_seq.load()) {
           // CRITICAL: Clear the mark so it doesn't interfere with the NEXT
           // rotation
-          recv_mark[g_ack_seq.load() & (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = 0;
+          recv_mark[g_ack_seq.load() &
+                    (DataBeam::SERVER_RECV_BUFFER_SIZE - 1)] = 0;
           g_ack_seq.fetch_add(1);
         }
         gap_filled = (g_ack_seq.load() > before + 1);
