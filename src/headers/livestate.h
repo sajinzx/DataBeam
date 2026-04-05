@@ -122,19 +122,23 @@ struct LiveState {
     double diff_ms = (double)(current_rtt - base) / 1000.0;
     int32_t cur_cwnd = cwnd.load();
 
-    if (diff_ms < (double)VEGAS_ALPHA_MS) {
-      // Path clear — grow window
-      int32_t new_cwnd = std::min(cur_cwnd + CWND_INCREMENT, cwnd_max);
+    if (diff_ms < (double)VEGAS_ALPHA_MS / 2.0) {
+      // Very clear path — grow aggressively (HighSpeed TCP style)
+      int32_t increment = std::max(4, cur_cwnd / 64);
+      int32_t new_cwnd = std::min(cur_cwnd + increment, cwnd_max);
       cwnd.store(new_cwnd);
       recompute_derived();
       return 1;
-    } else if (diff_ms > (double)VEGAS_BETA_MS) {
-      // Congestion building — shrink window
-      int32_t new_cwnd = std::max(cur_cwnd - cur_cwnd / 8, (int32_t)CWND_MIN);
+    } else if (diff_ms < (double)VEGAS_ALPHA_MS) {
+      // Path clear — steady growth
+      int32_t new_cwnd = std::min(cur_cwnd + 2, cwnd_max);
       cwnd.store(new_cwnd);
       recompute_derived();
-      return -1;
-    }
+      return 1;
+    } 
+    
+    // DELAY-BASED SHRINKING DISABLED: Relying purely on Packet Loss (on_timeout) 
+    // to gradually reduce window, per user request.
     return 0; // hold steady
   }
 
@@ -161,9 +165,9 @@ struct LiveState {
 
     last_timeout_us.store(now_us);
 
-    // Vegas: halve window on loss
+    // Gradually reduce on packet loss (e.g. 20% reduction) instead of halving abruptly
     int32_t cur = cwnd.load();
-    cwnd.store(std::max(cur / 2, (int32_t)CWND_MIN));
+    cwnd.store(std::max(cur - std::max(cur / 5, 10), (int32_t)CWND_MIN));
     recompute_derived();
   }
 

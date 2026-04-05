@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>
 
 #include "./headers/compress.h"
 #include "./headers/concurrentqueue.h"
@@ -550,9 +551,18 @@ int main() {
   int idle_timeouts = 0;
   bool is_receiving = true;
 
+  // Enable UDP Receive Offload (URO)
+  DWORD uro_max = 65536; // Maximum coalesced size
+  DWORD bytes_ret = 0;
+  if (WSAIoctl(sockfd, SIO_UDP_RECV_MAX_COALESCED_SIZE, &uro_max, sizeof(uro_max), NULL, 0, &bytes_ret, NULL, NULL) == SOCKET_ERROR) {
+    // cerr << " [SERVER] URO not natively supported" << endl;
+  } else {
+    cout << " [SERVER] URO (UDP Receive Coalescing) ENABLED!" << endl;
+  }
+
   // WSARecvFrom setup
   WSABUF wsabuf_recv;
-  char raw_buffer[sizeof(SlimDataPacket) + 64];
+  char raw_buffer[65536]; // 64KB for URO capacity
   wsabuf_recv.buf = raw_buffer;
   wsabuf_recv.len = sizeof(raw_buffer);
 

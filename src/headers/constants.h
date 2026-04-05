@@ -3,6 +3,35 @@
 
 #include <stdint.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mswsock.h>
+#endif
+
+// --- Windows UDP Segmentation Offload (USO) & URO Missing Macros ---
+#ifndef UDP_SEND_MSG_SIZE
+#define UDP_SEND_MSG_SIZE 2
+#endif
+
+#ifndef SIO_UDP_RECV_MAX_COALESCED_SIZE
+#define SIO_UDP_RECV_MAX_COALESCED_SIZE 0xD8000005
+#endif
+
+#ifndef LPFN_WSASENDMSG
+typedef int (WSAAPI *LPFN_WSASENDMSG)(
+  SOCKET s,
+  LPWSAMSG lpMsg,
+  DWORD dwFlags,
+  LPDWORD lpNumberOfBytesSent,
+  LPWSAOVERLAPPED lpOverlapped,
+  LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
+);
+#endif
+
 namespace DataBeam {
 
 // --- Network & Protocol Core ---
@@ -13,7 +42,7 @@ constexpr uint32_t MAX_FILENAME_LEN = 256;
 constexpr uint32_t MAX_USERNAME_LEN = 32;
 
 // --- Selective Repeat (SR) ARQ ---
-constexpr uint32_t SR_WINDOW_SIZE = 4096;
+constexpr uint32_t SR_WINDOW_SIZE = 8192;
 constexpr uint32_t SR_WINDOW_MASK = SR_WINDOW_SIZE - 1;
 constexpr uint32_t SR_SACK_BITMAP_CHUNKS =
     64; // 64 chunks * 64 bits = 4096 bits
@@ -61,11 +90,12 @@ constexpr uint8_t PROBE_RESULT_TYPE = 6;
 constexpr uint32_t PROBE_TIMEOUT_MS = 2000;
 
 // --- Vegas Congestion Control ---
-constexpr int32_t VEGAS_ALPHA_MS = 2;  // grow window if delay < alpha
-constexpr int32_t VEGAS_BETA_MS = 10;  // shrink window if delay > beta
-constexpr int32_t CWND_MIN = 64;       // minimum congestion window
+constexpr int32_t VEGAS_ALPHA_MS = 4;  // grow window if delay < alpha
+constexpr int32_t VEGAS_BETA_MS = 5;   // shrink window if delay > beta
+constexpr int32_t CWND_MIN = 128;      // minimum congestion window
 constexpr int32_t CWND_INCREMENT = 64; // additive increase per RTT cycle
-constexpr uint32_t VEGAS_ADJUST_INTERVAL = 100; // adjust every N ACKs
+constexpr uint32_t VEGAS_ADJUST_INTERVAL =
+    8; // adjust every 8 SACKs (equivalent to 256 packets if batch is 32)
 
 // --- Security & Integrity ---
 constexpr uint32_t SHARED_SECRET_KEY_LEN = 16;

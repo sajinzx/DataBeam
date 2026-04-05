@@ -26,6 +26,7 @@
 #include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mswsock.h>
 #include <zlib.h>
 
 #include "./headers/constants.h"
@@ -40,6 +41,8 @@
 
 // Tuning Constants (Now moved to constants.h)
 using namespace std;
+
+LPFN_WSASENDMSG WSASendMsg_ptr = nullptr;
 
 static const size_t RAW_Q_CAP =
     DataBeam::CLIENT_QUEUE_CAPACITY; // always 2*windowsize
@@ -496,18 +499,56 @@ void *sender_thread(void *arg) {
       if (transfer_complete)
         return nullptr;
 
-      ReadyPacket &cur = pending->get(next_send_seq);
-
-      // WSASendTo — Now using the pre-built wire_pkt from the compressor pool
-      WSABUF wsabuf;
-      wsabuf.buf = reinterpret_cast<CHAR *>(&cur.wire_pkt);
-      wsabuf.len = sizeof(cur.wire_pkt);
-      DWORD bytes_sent_dword = 0;
+      // Batching setup for USO
+      const int MAX_BATCH = 16;
+      int batch_count = 0;
+      WSABUF wsabufs[MAX_BATCH];
+      ReadyPacket* batch_pkts[MAX_BATCH];
+      
+      // Determine how many we can send in one burst (bounded by window limitation)
+      int allowed_to_send = g_live.cwnd.load() - arq.get_in_flight_count();
+      int batch_limit = std::min(MAX_BATCH, allowed_to_send);
+      if (batch_limit <= 0) batch_limit = 1; 
+      
+      for (int i = 0; i < batch_limit; i++) {
+        if (!pending->has(next_send_seq + i)) break;
+        batch_pkts[batch_count] = &pending->get(next_send_seq + i);
+        wsabufs[batch_count].buf = reinterpret_cast<CHAR *>(&batch_pkts[batch_count]->wire_pkt);
+        wsabufs[batch_count].len = sizeof(batch_pkts[batch_count]->wire_pkt);
+        batch_count++;
+      }
 
       long long t0 = g_cperf.now_us();
-      int result = WSASendTo((SOCKET)sockfd, &wsabuf, 1, &bytes_sent_dword, 0,
-                             reinterpret_cast<SOCKADDR *>(&server_addr),
-                             (int)addr_len, NULL, NULL);
+      DWORD bytes_sent_dword = 0;
+      int result = SOCKET_ERROR;
+
+      if (WSASendMsg_ptr != nullptr && batch_count > 1) {
+        // USE USO (UDP Segmentation Offload)
+        char ctrl_buf[WSA_CMSG_SPACE(sizeof(DWORD))] = {0};
+        
+        WSAMSG msg = {0};
+        msg.name = reinterpret_cast<LPSOCKADDR>(&server_addr);
+        msg.namelen = sizeof(server_addr);
+        msg.lpBuffers = wsabufs;
+        msg.dwBufferCount = batch_count;
+        msg.Control.buf = ctrl_buf;
+        msg.Control.len = sizeof(ctrl_buf);
+        msg.dwFlags = 0;
+
+        WSACMSGHDR *cmsg = WSA_CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = IPPROTO_UDP;
+        cmsg->cmsg_type = UDP_SEND_MSG_SIZE;
+        cmsg->cmsg_len = WSA_CMSG_LEN(sizeof(DWORD));
+        *(DWORD *)WSA_CMSG_DATA(cmsg) = sizeof(SlimDataPacket); // Segment size is 1435
+
+        result = WSASendMsg_ptr((SOCKET)sockfd, &msg, 0, &bytes_sent_dword, NULL, NULL);
+      } else {
+        // Fallback or single packet
+        batch_count = 1;
+        result = WSASendTo((SOCKET)sockfd, &wsabufs[0], 1, &bytes_sent_dword, 0,
+                           reinterpret_cast<SOCKADDR *>(&server_addr),
+                           (int)addr_len, NULL, NULL);
+      }
 
       g_cperf.total_send_syscall_us.fetch_add(g_cperf.now_us() - t0,
                                               std::memory_order_relaxed);
@@ -516,26 +557,27 @@ void *sender_thread(void *arg) {
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK || err == WSAENOBUFS) {
           std::this_thread::sleep_for(std::chrono::microseconds(500));
-          continue; // retry same packet
+          continue; // retry same batch
         }
-        cerr << " [SENDER] WSASendTo failed: " << err << endl;
+        cerr << " [SENDER] Send failed: " << err << endl;
         transfer_complete = true;
         return nullptr;
       }
 
       // Record in ARQ + update all global counters under one lock
       pthread_mutex_lock(&arq_mutex);
-      arq.record_sent_packet(cur.pkt);
-      arq.increment_seq_num();
-      chunks_sent++;
-      total_bytes_sent += cur.original_len;
-      chunk_offset += (uint64_t)cur.original_len;
+      for (int i = 0; i < batch_count; i++) {
+        arq.record_sent_packet(batch_pkts[i]->pkt);
+        arq.increment_seq_num();
+        chunks_sent++;
+        total_bytes_sent += batch_pkts[i]->original_len;
+        chunk_offset += (uint64_t)batch_pkts[i]->original_len;
+        pending->erase(next_send_seq); // O(1) -- just clears valid flag
+        next_send_seq++;
+      }
       pthread_mutex_unlock(&arq_mutex);
 
-      g_cperf.packets_sent.fetch_add(1, std::memory_order_relaxed);
-
-      pending->erase(next_send_seq); // O(1) -- just clears valid flag
-      next_send_seq++;
+      g_cperf.packets_sent.fetch_add(batch_count, std::memory_order_relaxed);
     }
 
     // ---- 3. Termination check ----------------------------------------
@@ -865,6 +907,23 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // Obtain WSASendMsg function pointer for UDP Batching
+  SOCKET test_sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (test_sock != INVALID_SOCKET) {
+    GUID guidWSASendMsg = WSAID_WSASENDMSG;
+    DWORD dwBytes = 0;
+    int rc = WSAIoctl(test_sock, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                      &guidWSASendMsg, sizeof(guidWSASendMsg),
+                      &WSASendMsg_ptr, sizeof(WSASendMsg_ptr),
+                      &dwBytes, NULL, NULL);
+    if (rc == SOCKET_ERROR) {
+      cerr << " Failed to obtain WSASendMsg: " << WSAGetLastError() << endl;
+    } else {
+      cout << " USO / WSASendMsg natively supported!" << endl;
+    }
+    closesocket(test_sock);
+  }
+
   filename_str = argv[1];
   string filenames = filename_str;
   // strcpy(filenames, filename_str);
@@ -1051,6 +1110,11 @@ int main(int argc, char *argv[]) {
             deserialize_probe_result(&result);
 
             g_live.init_from_probe(result.bandwidth_bps, handshake_rtt_us);
+            
+            // USER OVERRIDE: Set initial window exactly to server's raw measured capacity
+            g_live.cwnd.store(std::max((int32_t)DataBeam::CWND_MIN, std::min((int32_t)result.recommended_cwnd, (int32_t)DataBeam::SR_WINDOW_SIZE)));
+            g_live.recompute_derived();
+            
             arq.set_effective_cwnd(g_live.cwnd.load());
 
             cout << "[PROBE] Bandwidth: " << result.bandwidth_bps / 1000000.0
