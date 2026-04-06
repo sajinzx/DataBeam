@@ -9,9 +9,14 @@
 #include <cstdint>
 
 // =============================================================================
-// Entropy estimator — samples up to 256 bytes to decide if data is worth
-// compressing. Skips compression entirely for already-compressed data
-// (images, pre-zipped buffers, encrypted payloads) saving wasted CPU.
+// Entropy estimator — hardware-accelerated bitmask + POPCNT
+//
+// Instead of a 256-element freq[] array (1 KB stack, 256-iteration count loop),
+// we use a 256-bit bitmask (4 × uint64_t = 32 bytes) where bit N means
+// "byte value N was observed." At the end, __builtin_popcountll (compiles to
+// the SSE4.2 POPCNT instruction) counts all distinct values in ~4 clock
+// cycles instead of 256 iterations.
+//
 // Returns true if data is likely compressible.
 // =============================================================================
 static inline bool is_compressible(const char *data, size_t len) noexcept
@@ -20,20 +25,25 @@ static inline bool is_compressible(const char *data, size_t len) noexcept
     if (len < 64)
         return false;
 
+    // 256-bit bitmask: bit i == 1 means byte value i was seen
+    uint64_t seen[4] = {0, 0, 0, 0};
+
     // Sample up to 256 bytes evenly spread across the buffer
-    uint32_t freq[256] = {};
     size_t step = (len < 256) ? 1 : len / 256;
-    size_t samples = 0;
 
-    for (size_t i = 0; i < len; i += step, ++samples)
-        freq[(uint8_t)data[i]]++;
+    for (size_t i = 0; i < len; i += step)
+    {
+        uint8_t byte_val = (uint8_t)data[i];
+        // Set bit (byte_val) in the correct uint64_t quadrant
+        seen[byte_val >> 6] |= (1ULL << (byte_val & 63));
+    }
 
-    // Shannon entropy approximation — count distinct byte values seen
-    // High cardinality with uniform distribution = low compressibility
-    uint32_t distinct = 0;
-    for (int i = 0; i < 256; ++i)
-        if (freq[i])
-            ++distinct;
+    // Hardware POPCNT: count all set bits across the 4 quadrants
+    uint32_t distinct = (uint32_t)(
+        __builtin_popcountll(seen[0]) +
+        __builtin_popcountll(seen[1]) +
+        __builtin_popcountll(seen[2]) +
+        __builtin_popcountll(seen[3]));
 
     // Heuristic thresholds (tuned empirically):
     //   < 64  distinct values  → text/structured data  → compress

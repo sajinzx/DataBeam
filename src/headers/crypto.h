@@ -7,7 +7,7 @@
 #include "packet.h"
 
 // Hardcoded shared key for HMAC and AES-128
-extern const uint8_t SHARED_SECRET_KEY[16];
+extern const uint8_t *SHARED_SECRET_KEY;
 
 // Generate 16 bytes of random IV
 void generate_iv(uint64_t *iv);

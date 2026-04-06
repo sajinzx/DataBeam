@@ -8,10 +8,9 @@
 
 using namespace std;
 
-// Hardcoded shared key for simplicity (16 bytes for AES-128)
-const uint8_t SHARED_SECRET_KEY[16] = {
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10};
+// Security keys are now in constants.h
+#include "headers/constants.h"
+const uint8_t *SHARED_SECRET_KEY = DataBeam::SHARED_SECRET_KEY;
 void expand_iv_8_to_16(const uint64_t *iv8, uint8_t iv16[16])
 {
     // Copy 8 bytes
@@ -89,20 +88,20 @@ bool generate_hmac(const uint8_t *packet_data, size_t packet_len,
     unsigned int len = 32;
     uint8_t full_hmac[32];
 
-    if (!HMAC(EVP_sha256(), key, 16, packet_data, packet_len, full_hmac, &len))
+    if (!HMAC(EVP_sha256(), key, DataBeam::SHARED_SECRET_KEY_LEN, packet_data, packet_len, full_hmac, &len))
         return false;
 
-    memcpy(hmac_out, full_hmac, 16); // truncate to 16 bytes
+    memcpy(hmac_out, full_hmac, DataBeam::HMAC_TAG_LEN); // truncate to 16 bytes
     return true;
 }
 
 bool verify_hmac(const uint8_t *packet_data, size_t packet_len,
                  const uint8_t *key, const uint8_t *expected_hmac)
 {
-    uint8_t computed_hmac[16];
+    uint8_t computed_hmac[DataBeam::HMAC_TAG_LEN];
 
     if (!generate_hmac(packet_data, packet_len, key, computed_hmac))
         return false;
 
-    return CRYPTO_memcmp(computed_hmac, expected_hmac, 16) == 0;
+    return CRYPTO_memcmp(computed_hmac, expected_hmac, DataBeam::HMAC_TAG_LEN) == 0;
 }

@@ -5,20 +5,14 @@
 #include <deque>
 #include <chrono>
 #include "packet.h"
+#include "constants.h"
 
 using namespace std;
-
-const uint8_t WINDOW_SIZE = 8;    // Go-Back-N window size
-const double ALPHA_RTT = 0.125;   // EMA smoothing factor (1/8)
-const double BETA_RTTVAR = 0.25;  // RTT variance smoothing factor
-const int INITIAL_RTO = 500;      // Initial RTO: 500ms
-const double AIMD_INCREASE = 1.0; // Additive Increase: +1 packet per RTT
-const double AIMD_DECREASE = 0.5; // Multiplicative Decrease: * 0.5 on loss
 
 // Structure to track sent packets
 struct SentPacket
 {
-    Packet pkt;
+    SlimDataPacket pkt;
     chrono::high_resolution_clock::time_point send_time;
     int retransmit_count;
 };
@@ -52,14 +46,14 @@ public:
     int get_in_flight_count() const { return sent_buffer.size(); }
 
     // Sending
-    void record_sent_packet(const Packet &pkt);
+    void record_sent_packet(const SlimDataPacket &pkt);
     void increment_seq_num() { next_seq_num++; }
 
     // ACK handling
     void handle_ack(uint16_t ack_num);
 
     // Retransmission
-    bool check_for_timeout(Packet &pkt_to_retransmit);
+    bool check_for_timeout(SlimDataPacket &pkt_to_retransmit);
     void mark_loss();
 
     // RTT measurement

@@ -13,8 +13,8 @@ using namespace std;
 // Constructor: Initialize ARQ state
 GoBackNARQ::GoBackNARQ()
     : send_base(1), next_seq_num(1),
-      srtt_us(INITIAL_RTO * 1000), rttvar_us(INITIAL_RTO * 500),
-      rto_ms(INITIAL_RTO), congestion_window(1.0), threshold(32.0),
+      srtt_us(DataBeam::GBN_INITIAL_RTO_MS * DataBeam::US_PER_MS), rttvar_us(DataBeam::GBN_INITIAL_RTO_MS * 500),
+      rto_ms(DataBeam::GBN_INITIAL_RTO_MS), congestion_window(1.0), threshold(DataBeam::CC_INITIAL_THRESHOLD),
       in_slow_start(true)
 {
 }
@@ -23,13 +23,13 @@ GoBackNARQ::GoBackNARQ()
 bool GoBackNARQ::can_send_packet() const
 {
     int in_flight = next_seq_num - send_base;
-    return in_flight < (int)congestion_window && in_flight < WINDOW_SIZE;
+    return in_flight < (int)congestion_window && in_flight < (int)DataBeam::GBN_WINDOW_SIZE;
 }
 
 // Get actual window size (constrained by congestion window)
 uint8_t GoBackNARQ::get_window_size() const
 {
-    return (uint8_t)min((double)WINDOW_SIZE, congestion_window);
+    return (uint8_t)min((double)DataBeam::GBN_WINDOW_SIZE, congestion_window);
 }
 
 // Record a packet as sent
@@ -65,17 +65,17 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
             }
             else
             {
-                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us +
-                            BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
-                srtt_us = (1 - ALPHA_RTT) * srtt_us + ALPHA_RTT * rtt_sample;
+                rttvar_us = (1 - DataBeam::BETA_RTTVAR) * rttvar_us +
+                            DataBeam::BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
+                srtt_us = (1 - DataBeam::ALPHA_RTT) * srtt_us + DataBeam::ALPHA_RTT * rtt_sample;
             }
 
             // Update RTO: SRTT + 4 * RTTVAR, with bounds [1ms, 60s]
-            rto_ms = (srtt_us + 4 * rttvar_us) / 1000;
+            rto_ms = (srtt_us + 4 * rttvar_us) / DataBeam::US_PER_MS;
             if (rto_ms < 1)
                 rto_ms = 1;
-            if (rto_ms > 60000)
-                rto_ms = 60000;
+            if (rto_ms > DataBeam::GBN_MAX_RTO_MS)
+                rto_ms = DataBeam::GBN_MAX_RTO_MS;
         }
         sent_buffer.pop_front();
     }
@@ -90,15 +90,15 @@ void GoBackNARQ::handle_ack(uint16_t ack_num)
     {
         // Congestion avoidance: additive increase
         in_slow_start = false;
-        congestion_window += AIMD_INCREASE / congestion_window;
+        congestion_window += DataBeam::CC_AIMD_INCREASE / congestion_window;
     }
 
-    if (congestion_window > WINDOW_SIZE)
-        congestion_window = WINDOW_SIZE;
+    if (congestion_window > (double)DataBeam::GBN_WINDOW_SIZE)
+        congestion_window = (double)DataBeam::GBN_WINDOW_SIZE;
 }
 
 // Check for timeout and prepare packet for retransmission
-bool GoBackNARQ::check_for_timeout(const SlimDataPacket &pkt_to_retransmit)
+bool GoBackNARQ::check_for_timeout(SlimDataPacket &pkt_to_retransmit)
 {
     if (sent_buffer.empty())
         return false;
@@ -154,16 +154,16 @@ void GoBackNARQ::update_rtt(uint16_t seq_num)
             }
             else
             {
-                rttvar_us = (1 - BETA_RTTVAR) * rttvar_us +
-                            BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
-                srtt_us = (1 - ALPHA_RTT) * srtt_us + ALPHA_RTT * rtt_sample;
+                rttvar_us = (1 - DataBeam::BETA_RTTVAR) * rttvar_us +
+                            DataBeam::BETA_RTTVAR * abs((int32_t)rtt_sample - (int32_t)srtt_us);
+                srtt_us = (1 - DataBeam::ALPHA_RTT) * srtt_us + DataBeam::ALPHA_RTT * rtt_sample;
             }
 
             rto_ms = (srtt_us + 4 * rttvar_us) / 1000;
             if (rto_ms < 1)
                 rto_ms = 1;
-            if (rto_ms > 60000)
-                rto_ms = 60000;
+            if (rto_ms > DataBeam::GBN_MAX_RTO_MS)
+                rto_ms = DataBeam::GBN_MAX_RTO_MS;
 
             return;
         }
